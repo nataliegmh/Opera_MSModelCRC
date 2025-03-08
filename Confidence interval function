@@ -1,0 +1,710 @@
+##################################### Initial setup ###########################
+# rm(list = ls())  # remove any variables in R's memory 
+library(dplyr)    # to manipulate data
+library(reshape2) # to transform data
+library(ggplot2)  # for nice looking plots
+library(scales)   # for dollar signs and commas
+# devtools::install_github("DARTH-git/dampack") # to install dampack form GitHub
+library(dampack)  # for CEA and calculate ICERs
+
+#### download requred packages and attach CEAutil package
+if(!require("remotes")) install.packages("remotes")
+if(!require("dplyr")) install.packages("dplyr")
+if(!require(dampack)) remotes::install_github("DARTH-git/dampack", dependencies = TRUE)
+if(!require("CEAutil")) remotes::install_github("syzoekao/CEAutil", dependencies = TRUE)
+
+## General setup
+
+#################################################################################
+n_age_init <-60 # age at baseline
+n_age_max <-69 # maximum age of follow up
+n_cycles<-(n_age_max-n_age_init) # time horizon, number of cycles
+
+########### Gender and Age-specific probability of dying when Healthy (all-cause mortality) ############################
+
+sex<-"Total"
+
+## Age-dependent mortality rates
+lt_usa_2005 <- read.csv("/Users/correale/Dropbox/CEA_CRC_CADe_vs_Colonoscopy/RCODE/DATA-R/LifeTable_Whole_by_sex.R.csv",na.strings=c("NA",""," "))
+lt_usa_2005$Age<-seq(0,100,1)
+v_p_mort_by_age <- lt_usa_2005 %>% filter(Age >= n_age_init & Age <= n_age_max) # %>% select("px") # %>%
+ # as.matrix() 
+v_r_mort_by_age <- lt_usa_2005 %>% 
+   filter(Age >= n_age_init & Age <= n_age_max) # %>%
+ # select("qx") %>%
+ # as.matrix()
+
+v_p_mort_by_age<-as.matrix(v_p_mort_by_age[,"px"])
+v_r_mort_by_age<-as.matrix(v_r_mort_by_age[,"qx"])
+
+v_p_HDage<-v_p_mort_by_age[1:n_cycles]
+v_r_HDage <-v_r_mort_by_age[1:n_cycles]
+
+p_HDage<-v_p_mort_by_age[1:n_cycles]   ### 1 - exp(-v_r_HDage)
+p_HDage<-p_HDage[1:n_cycles]
+
+########## baseline data #############
+psa_crc_model<-readRDS("psa_crc_model.rsd")
+
+################# Initial v_i #####################
+v_n<-c("H","LR","HG","DA","CL","CR","DC","SympL","SympR","SympD","D","DL","DR","DD","SL","SL1","SL2","SL3","SR","SR1","SR2","SR3","SurvivalL","SurvivalR","SympD1","PLR","SympA","SA","SA1","SA2","SA3","SurvivalA","PHG","PH")
+
+n_states <- length(v_n) # number of health states 
+
+######### ###  cohorts of patients with 10 years of follow-up
+#### base case scenario
+n_age<-n_age_init
+
+n_t<-n_cycles
+
+len<-length(n_age)
+
+###### follow-up UC
+### negative, endoscopist >55% FIT, 37.7/100; high-risk, 37.1/100, low-risk, 25.2/100
+ 
+# v_is<-c("H"=0,"LR"=0.0,"HG"=0.327,"DA"=0.0,"CL"=0.0,"CR"=0.00,"DC"=0.00,"SympL"=0.0,"SympR"=0.00,"SympD"=0.00,"D"=0,"DL"=0,"DR"=0,"DD"=0,"SL"=0,"SL1"=0,"SL2"=0,"SL3"=0,"SR"=0,"SR1"=0,"SR2"=0,"SR3"=0,"SurvivalL"=0,"SurvivalR"=0,"SympD1"=0,"PLR"=0.0,"SympA"=0.0,"SA"=0.00,"SA1"=0,"SA2"=0,"SA3"=0,"SurvivalA"=0,"PHG"=0,"PH"=0)
+
+v_is<-c("H"=0,"LR"=0.0,"HG"=0,"DA"=0.0,"CL"=0.0,"CR"=0.00,"DC"=0.00,"SympL"=0,"SympR"=0,"SympD"= 0.0,"D"=0,"DL"=0,"DR"=0,"DD"=0,"SL"=0,"SL1"=0,"SL2"=0,"SL3"=0,"SR"=0,"SR1"=0,"SR2"=0,"SR3"=0,"SurvivalL"=0,"SurvivalR"=0,"SympD1"=0,"PLR"=0.0,"SympA"=1.0,"SA"=0,"SA1"=0,"SA2"=0,"SA3"=0,"SurvivalA"=0,"PHG"=0,"PH"=0)
+
+### 0506/100 0.34 Stage1; 0.36 Stage2; 0.19 Stage3; 0.11 StageD
+
+#### whole no-screening
+v_ins<-c("H"=0,"LR"=0.0,"HG"=0.327,"DA"=0.00,"CL"=0.000,"CR"=0.00,"DC"=0.000,"SympL"=0.000,"SympR"=0.00,"SympD"=0.000,"D"=0,"DL"=0,"DR"=0,"DD"=0,"SL"=0,"SL1"=0,"SL2"=0,"SL3"=0,"SR"=0,"SR1"=0,"SR2"=0,"SR3"=0,"SurvivalL"=0,"SurvivalR"=0,"SympD1"=0,"PLR"=0.0,"SympA"=0.00,"SA"=0.00,"SA1"=0,"SA2"=0,"SA3"=0,"SurvivalA"=0,"PHG"=0,"PH"=0)
+
+d_c <- 0.03 # discount rate for costs 
+d_e <- 0.03 # discount rate for QALYs
+
+d_wc<-0.03
+
+half<-1
+
+#################################################################
+#################################################################
+################# PSA distribution ################
+
+####### see function in the file a_P_function_CRC_ir_Zorzi_FIT.txt 
+############## No screeening ###########
+#########################################################
+
+####### UC #####
+v_i<-v_is
+Strategy="UC"
+
+norm<-sum(v_i)
+v_i[1]<-1-norm
+names(v_i)<-v_n
+
+v_n_tunnels<-v_n
+n_states_tunnels <- length(v_n_tunnels)  
+
+v_s_init_tunnels<-v_i
+v_initial<-v_i
+v_s_init_tunnels<-v_i
+v_initial<-v_i
+
+
+# N<-10000
+N<-1
+dat_outcome<-data.frame()
+
+for(n_rep in 1:N){
+	      
+    #  psa_set<-psa_values[n_rep,]
+      
+      psa_set$Strategy<-"UC"
+
+      df<-data.frame()
+      df_ce<-data.frame()
+
+      # Initialize 3-D array
+
+      a_P_tunnels<- array(0, dim = c(n_states_tunnels, n_states_tunnels, n_t + 1), dimnames = list(v_n_tunnels, v_n_tunnels, 0:n_t))
+      a_A_tunnels<- array(0, dim = c(n_states_tunnels, n_states_tunnels, n_t + 1), dimnames = list(v_n_tunnels, v_n_tunnels, 0:n_t))
+
+# Set first slice of A with the initial state vector in its diagonal
+      diag(a_A_tunnels[, , 1]) <- v_s_init_tunnels
+
+      m_M_tunnels<-matrix(0, nrow = (n_t + 1), ncol = n_states_tunnels, dimnames = list(0:n_t, v_n_tunnels))
+      m_M_tunnels[1, ]<-v_s_init_tunnels
+
+    a_P_tunnels<-a_P_function_CRC_sc(n_age_init,n_age_max,p_HDage,psa_set)
+       
+      for(t in 1:n_t){
+      # Fill in cohort trace
+      m_M_tunnels[t + 1, ] <- m_M_tunnels[t, ] %*% a_P_tunnels[, , t]
+      # Fill in tansition dynamics array
+      a_A_tunnels[, , t + 1]  <- m_M_tunnels[t, ] * a_P_tunnels[, , t]
+      }
+
+     df<-as.data.frame(m_M_tunnels)
+     df$v_s_ad<-rowSums(df[,c(-11,-12,-13,-14)])
+     df$n_risk<-rowSums(df[,c(1:7,26,33,34)])
+     df$n1_risk<-rowSums(df[,c(1:10,15:22,25:31,33,34)])
+     df$Age<-seq(n_age_init,n_age_max,1)
+     df$Symp<-rowSums(df[,c(8:10,27)])     
+
+     df$deathA<-colSums(a_A_tunnels[c(27:31),"DL",])
+     df$nA<-rowSums(df[,c("SympA","SA","SA1","SA2","SA3")])
+     df$deathB<-colSums(a_A_tunnels[c(8,15:18),"DL",])
+     df$nB<-rowSums(df[,c("SympL","SL","SL1","SL2","SL3")])
+     df$deathC<-colSums(a_A_tunnels[c(9,19:22),"DR",])
+     df$nC<-rowSums(df[,c("SympR","SR","SR1","SR2","SR3")])
+     df$deathD<-colSums(a_A_tunnels[c(10,25),"DD",])
+     df$nD<-rowSums(df[,c("SympD","SympD1")])
+
+     
+     df$DDCRC<-rowSums(df[,c("DL","DR","DD")])
+     vec1<-df$DDCRC
+     result <- vec1[1]     
+     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+     df$DeadCRC<-result
+
+     vec1<-df$D
+     result <- vec1[1]
+     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+     df$DOther<-result
+
+     df$mortality<-df$DOther + df$DeadCRC
+
+     tmp<-aggregate(data=df,Symp~1,FUN=sum)
+     tmp$Rep<-n_rep
+     tmp$test<-Strategy
+     tmp$pCRC<-aggregate(data=df[-1,],Symp~1,FUN=sum)[,"Symp"]
+     tmp$n<-sum(df[1:10,"n_risk"])
+     tmp$n1<-sum(df[1:10,"n1_risk"])
+     tmp$v_s_ad<-sum(df[1:10,"v_s_ad"])
+     tmp$death<-sum(df[1:10,"DeadCRC"])
+     tmp$mortality<-sum(df[1:10,"mortality"])
+     
+     tmp$StageA<-sum(df[1:10,"SympA"])
+     tmp$StageB<-sum(df[1:10,"SympL"])
+     tmp$StageC<-sum(df[1:10,"SympR"])
+     tmp$StageD<-sum(df[1:10,"SympD"])
+
+     tmp$deathA<-sum(df[1:10,"deathA"])
+     tmp$deathB<-sum(df[1:10,"deathB"])
+     tmp$deathC<-sum(df[1:10,"deathC"])
+     tmp$deathD<-sum(df[1:10,"deathD"])
+
+     
+     tmp$nA<-sum(df[1:10,"nA"])
+     tmp$nB<-sum(df[1:10,"nB"])
+     tmp$nC<-sum(df[1:10,"nC"])
+     tmp$nD<-sum(df[1:10,"nD"])
+
+     dat_outcome<-rbind(dat_outcome,tmp)
+          
+}
+
+my_example_psa$"Outcomes_UC"<-dat_outcome
+
+######################## AI1 
+N<-1
+####### AI1 #####
+Strategy="AI1"
+v_i<-v_is
+
+norm<-sum(v_i)
+v_i[1]<-1-norm
+names(v_i)<-v_n
+
+v_n_tunnels<-v_n
+n_states_tunnels <- length(v_n_tunnels)  
+
+v_s_init_tunnels<-v_i
+v_initial<-v_i
+v_s_init_tunnels<-v_i
+v_initial<-v_i
+
+# v_i<-v_1i
+# N<-1000
+N<-1
+dat_outcome<-data.frame()
+for(n_rep in 1:N){
+	      
+    #  psa_set<-psa_values[n_rep,]
+      
+     psa_set$Strategy<-"AI3"
+
+      df<-data.frame()
+      df_ce<-data.frame()
+
+      # Initialize 3-D array
+
+      a_P_tunnels<- array(0, dim = c(n_states_tunnels, n_states_tunnels, n_t + 1), dimnames = list(v_n_tunnels, v_n_tunnels, 0:n_t))
+      a_A_tunnels<- array(0, dim = c(n_states_tunnels, n_states_tunnels, n_t + 1), dimnames = list(v_n_tunnels, v_n_tunnels, 0:n_t))
+
+# Set first slice of A with the initial state vector in its diagonal
+      diag(a_A_tunnels[, , 1]) <- v_s_init_tunnels
+
+      m_M_tunnels<-matrix(0, nrow = (n_t + 1), ncol = n_states_tunnels, dimnames = list(0:n_t, v_n_tunnels))
+      m_M_tunnels[1, ]<-v_s_init_tunnels
+
+      a_P_tunnels<-a_P_function_CRC_Zorzi_ai(n_age_init,n_age_max,p_HDage,psa_set)
+            
+      for(t in 1:n_t){
+      # Fill in cohort trace
+      m_M_tunnels[t + 1, ] <- m_M_tunnels[t, ] %*% a_P_tunnels[, , t]
+      # Fill in tansition dynamics array
+      a_A_tunnels[, , t + 1]  <- m_M_tunnels[t, ] * a_P_tunnels[, , t]
+      }
+
+     df<-as.data.frame(m_M_tunnels)
+     df$v_s_ad<-rowSums(df[,c(-11,-12,-13,-14)])
+     df$n_risk<-rowSums(df[,c(1:7,26,33,34)])
+     df$n1_risk<-rowSums(df[,c(1:10,15:22,25:31,33,34)])
+     df$Age<-seq(n_age_init,n_age_max,1)
+     df$Symp<-rowSums(df[,c(8:10,27)])     
+
+     df$deathA<-colSums(a_A_tunnels[c(27:31),"DL",])
+     df$nA<-rowSums(df[,c("SympA","SA","SA1","SA2","SA3")])
+     df$deathB<-colSums(a_A_tunnels[c(8,15:18),"DL",])
+     df$nB<-rowSums(df[,c("SympL","SL","SL1","SL2","SL3")])
+     df$deathC<-colSums(a_A_tunnels[c(9,19:22),"DR",])
+     df$nC<-rowSums(df[,c("SympR","SR","SR1","SR2","SR3")])
+     df$deathD<-colSums(a_A_tunnels[c(10,25),"DD",])
+     df$nD<-rowSums(df[,c("SympD","SympD1")])
+
+     df$DDCRC<-rowSums(df[,c("DL","DR","DD")])
+     vec1<-df$DDCRC
+     result <- vec1[1]     
+     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+     df$DeadCRC<-result
+
+     vec1<-df$D
+     result <- vec1[1]
+     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+     df$DOther<-result
+
+     df$mortality<-df$DOther + df$DeadCRC
+
+     tmp<-aggregate(data=df,Symp~1,FUN=sum)
+     tmp$Rep<-n_rep
+     tmp$test<-Strategy
+     tmp$pCRC<-aggregate(data=df[-1,],Symp~1,FUN=sum)[,"Symp"]
+     tmp$n<-sum(df[1:10,"n_risk"])
+     tmp$n1<-sum(df[1:10,"n1_risk"])
+     tmp$v_s_ad<-sum(df[1:10,"v_s_ad"])
+     tmp$death<-sum(df[1:10,"DeadCRC"])
+     tmp$mortality<-sum(df[1:10,"mortality"])
+     
+     tmp$StageA<-sum(df[1:10,"SympA"])
+     tmp$StageB<-sum(df[1:10,"SympL"])
+     tmp$StageC<-sum(df[1:10,"SympR"])
+     tmp$StageD<-sum(df[1:10,"SympD"])
+
+     tmp$deathA<-sum(df[1:10,"deathA"])
+     tmp$deathB<-sum(df[1:10,"deathB"])
+     tmp$deathC<-sum(df[1:10,"deathC"])
+     tmp$deathD<-sum(df[1:10,"deathD"])
+
+     
+     tmp$nA<-sum(df[1:10,"nA"])
+     tmp$nB<-sum(df[1:10,"nB"])
+     tmp$nC<-sum(df[1:10,"nC"])
+     tmp$nD<-sum(df[1:10,"nD"])
+
+     dat_outcome<-rbind(dat_outcome,tmp)
+          
+}
+
+# my_example_psa$"Outcomes_AI1"<-dat_outcome
+dat_AI1<-dat_outcome
+df_AI1<-df
+m_M_AI1<-m_M_tunnels
+a_A_AI1<-a_A_tunnels	
+##########################################################
+######################## AI2 
+
+####### AI2 #####
+Strategy="AI2"
+v_i<-v_is
+
+norm<-sum(v_i)
+v_i[1]<-1-norm
+names(v_i)<-v_n
+
+v_n_tunnels<-v_n
+n_states_tunnels <- length(v_n_tunnels)  
+
+v_s_init_tunnels<-v_i
+v_initial<-v_i
+v_s_init_tunnels<-v_i
+v_initial<-v_i
+
+# v_i<-v_2i
+# N<-1000
+# N<-10000
+N<-1
+dat_outcome<-data.frame()
+
+for(n_rep in 1:N){
+	      
+#      psa_set<-psa_values[n_rep,]
+      
+      psa_set$Strategy<-"AI2"
+
+      df<-data.frame()
+      df_ce<-data.frame()
+
+      # Initialize 3-D array
+
+      a_P_tunnels<- array(0, dim = c(n_states_tunnels, n_states_tunnels, n_t + 1), dimnames = list(v_n_tunnels, v_n_tunnels, 0:n_t))
+      a_A_tunnels<- array(0, dim = c(n_states_tunnels, n_states_tunnels, n_t + 1), dimnames = list(v_n_tunnels, v_n_tunnels, 0:n_t))
+
+# Set first slice of A with the initial state vector in its diagonal
+      diag(a_A_tunnels[, , 1]) <- v_s_init_tunnels
+
+      m_M_tunnels<-matrix(0, nrow = (n_t + 1), ncol = n_states_tunnels, dimnames = list(0:n_t, v_n_tunnels))
+      m_M_tunnels[1, ]<-v_s_init_tunnels
+
+      a_P_tunnels<-a_P_function_CRC_Zorzi_ai(n_age_init,n_age_max,p_HDage,psa_set)
+            
+      for(t in 1:n_t){
+      # Fill in cohort trace
+      m_M_tunnels[t + 1, ] <- m_M_tunnels[t, ] %*% a_P_tunnels[, , t]
+      # Fill in tansition dynamics array
+      a_A_tunnels[, , t + 1]  <- m_M_tunnels[t, ] * a_P_tunnels[, , t]
+      }
+
+     df<-as.data.frame(m_M_tunnels)
+     df$v_s_ad<-rowSums(df[,c(-11,-12,-13,-14,-34)])
+     df$n_risk<-rowSums(df[,c(1:7,26,33)])
+     df$n1_risk<-rowSums(df[,c(1:10,15:22,25:31,33)])
+     df$Age<-seq(n_age_init,n_age_max,1)
+     df$Symp<-rowSums(df[,c(8:10,27)])     
+
+     df$deathA<-colSums(a_A_tunnels[c(27:31),"DL",])
+     df$nA<-rowSums(df[,c("SympA","SA","SA1","SA2","SA3")])
+     df$deathB<-colSums(a_A_tunnels[c(8,15:18),"DL",])
+     df$nB<-rowSums(df[,c("SympL","SL","SL1","SL2","SL3")])
+     df$deathC<-colSums(a_A_tunnels[c(9,19:22),"DR",])
+     df$nC<-rowSums(df[,c("SympR","SR","SR1","SR2","SR3")])
+     df$deathD<-colSums(a_A_tunnels[c(10,25),"DD",])
+     df$nD<-rowSums(df[,c("SympD","SympD1")])
+
+     df$DDCRC<-rowSums(df[,c("DL","DR","DD")])
+     vec1<-df$DDCRC
+     result <- vec1[1]     
+     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+     df$DeadCRC<-result
+
+     vec1<-df$D
+     result <- vec1[1]
+     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+     df$DOther<-result
+
+     df$mortality<-df$DOther + df$DeadCRC
+
+     vec1<-df$PH
+     result <- vec1[1]
+     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+     df$censored<-result
+
+     tmp<-aggregate(data=df,Symp~1,FUN=sum)
+     tmp$Rep<-n_rep
+     tmp$test<-Strategy
+     tmp$pCRC<-aggregate(data=df[-1,],Symp~1,FUN=sum)[,"Symp"]
+     tmp$n<-sum(df[1:10,"n_risk"])
+     tmp$n1<-sum(df[1:10,"n1_risk"])
+     tmp$v_s_ad<-sum(df[1:10,"v_s_ad"])
+     tmp$death<-sum(df[1:10,"DeadCRC"])
+     tmp$mortality<-sum(df[1:10,"mortality"])
+     tmp$censored<-sum(df[1:10,"censored"])
+     
+     tmp$StageA<-sum(df[1:10,"SympA"])
+     tmp$StageB<-sum(df[1:10,"SympL"])
+     tmp$StageC<-sum(df[1:10,"SympR"])
+     tmp$StageD<-sum(df[1:10,"SympD"])
+
+     tmp$deathA<-sum(df[1:10,"deathA"])
+     tmp$deathB<-sum(df[1:10,"deathB"])
+     tmp$deathC<-sum(df[1:10,"deathC"])
+     tmp$deathD<-sum(df[1:10,"deathD"])
+
+     
+     tmp$nA<-sum(df[1:10,"nA"])
+     tmp$nB<-sum(df[1:10,"nB"])
+     tmp$nC<-sum(df[1:10,"nC"])
+     tmp$nD<-sum(df[1:10,"nD"])
+
+     dat_outcome<-rbind(dat_outcome,tmp)
+          
+}
+
+# my_example_psa$"Outcomes_AI2"<-dat_outcome
+dat_AI2<-dat_outcome
+df_AI2<-df
+m_M_AI2<-m_M_tunnels
+a_A_AI2<-a_A_tunnels	
+##########################################################
+
+####### AI3 #####
+Strategy="AI3"
+v_i<-v_is
+Strategy="AI3"
+norm<-sum(v_i)
+v_i[1]<-1-norm
+names(v_i)<-v_n
+
+v_n_tunnels<-v_n
+n_states_tunnels <- length(v_n_tunnels)  
+
+v_s_init_tunnels<-v_i
+v_initial<-v_i
+v_s_init_tunnels<-v_i
+v_initial<-v_i
+
+# v_i<-v_3i
+# N<-1000
+N<-1
+dat_outcome<-data.frame()
+
+for(n_rep in 1:N){
+	      
+    #  psa_set<-psa_values[n_rep,]
+      
+      psa_set$Strategy<-"AI3"
+
+      df<-data.frame()
+      df_ce<-data.frame()
+
+      # Initialize 3-D array
+
+      a_P_tunnels<- array(0, dim = c(n_states_tunnels, n_states_tunnels, n_t + 1), dimnames = list(v_n_tunnels, v_n_tunnels, 0:n_t))
+      a_A_tunnels<- array(0, dim = c(n_states_tunnels, n_states_tunnels, n_t + 1), dimnames = list(v_n_tunnels, v_n_tunnels, 0:n_t))
+
+# Set first slice of A with the initial state vector in its diagonal
+      diag(a_A_tunnels[, , 1]) <- v_s_init_tunnels
+
+      m_M_tunnels<-matrix(0, nrow = (n_t + 1), ncol = n_states_tunnels, dimnames = list(0:n_t, v_n_tunnels))
+      m_M_tunnels[1, ]<-v_s_init_tunnels
+
+      a_P_tunnels<-a_P_function_CRC_Zorzi_ai(n_age_init,n_age_max,p_HDage,psa_set)
+            
+      for(t in 1:n_t){
+      # Fill in cohort trace
+      m_M_tunnels[t + 1, ] <- m_M_tunnels[t, ] %*% a_P_tunnels[, , t]
+      # Fill in tansition dynamics array
+      a_A_tunnels[, , t + 1]  <- m_M_tunnels[t, ] * a_P_tunnels[, , t]
+      }
+
+     df<-as.data.frame(m_M_tunnels)
+     df$v_s_ad<-rowSums(df[,c(-11,-12,-13,-14,-34)])
+     df$n_risk<-rowSums(df[,c(1:7,26,33)])
+     df$n1_risk<-rowSums(df[,c(1:10,15:22,25:31,33)])
+     df$Age<-seq(n_age_init,n_age_max,1)
+     df$Symp<-rowSums(df[,c(8:10,27)])     
+
+     df$deathA<-colSums(a_A_tunnels[c(27:31),"DL",])
+     df$nA<-rowSums(df[,c("SympA","SA","SA1","SA2","SA3")])
+     df$deathB<-colSums(a_A_tunnels[c(8,15:18),"DL",])
+     df$nB<-rowSums(df[,c("SympL","SL","SL1","SL2","SL3")])
+     df$deathC<-colSums(a_A_tunnels[c(9,19:22),"DR",])
+     df$nC<-rowSums(df[,c("SympR","SR","SR1","SR2","SR3")])
+     df$deathD<-colSums(a_A_tunnels[c(10,25),"DD",])
+     df$nD<-rowSums(df[,c("SympD","SympD1")])
+
+     df$DDCRC<-rowSums(df[,c("DL","DR","DD")])
+     vec1<-df$DDCRC
+     result <- vec1[1]     
+     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+     df$DeadCRC<-result
+
+     vec1<-df$D
+     result <- vec1[1]
+     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+     df$DOther<-result
+
+     df$mortality<-df$DOther + df$DeadCRC
+
+     
+     vec1<-df$PH
+     result <- vec1[1]
+     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+     df$censored<-result
+
+     tmp<-aggregate(data=df,Symp~1,FUN=sum)
+     tmp$Rep<-n_rep
+     tmp$test<-Strategy
+     tmp$pCRC<-aggregate(data=df[-1,],Symp~1,FUN=sum)[,"Symp"]
+     tmp$n<-sum(df[1:10,"n_risk"])
+     tmp$n1<-sum(df[1:10,"n1_risk"])
+     tmp$v_s_ad<-sum(df[1:10,"v_s_ad"])
+     tmp$death<-sum(df[1:10,"DeadCRC"])
+     tmp$mortality<-sum(df[1:10,"mortality"])
+     tmp$censored<-sum(df[1:10,"censored"])
+	  
+     tmp$StageA<-sum(df[1:10,"SympA"])
+     tmp$StageB<-sum(df[1:10,"SympL"])
+     tmp$StageC<-sum(df[1:10,"SympR"])
+     tmp$StageD<-sum(df[1:10,"SympD"])
+
+     tmp$deathA<-sum(df[1:10,"deathA"])
+     tmp$deathB<-sum(df[1:10,"deathB"])
+     tmp$deathC<-sum(df[1:10,"deathC"])
+     tmp$deathD<-sum(df[1:10,"deathD"])
+
+     
+     tmp$nA<-sum(df[1:10,"nA"])
+     tmp$nB<-sum(df[1:10,"nB"])
+     tmp$nC<-sum(df[1:10,"nC"])
+     tmp$nD<-sum(df[1:10,"nD"])
+
+     dat_outcome<-rbind(dat_outcome,tmp)
+          
+}
+
+# my_example_psa$"Outcomes_AI3"<-dat_outcome
+dat_AI3<-dat_outcome
+df_AI3<-df
+m_M_AI3<-m_M_tunnels
+a_A_AI3<-a_A_tunnels	
+##########################################################
+
+dat_outcome<-data.frame()
+m_M_tunnels<-0.36*m_M_AI2+(1-0.36)*m_M_AI3
+a_A_tunnels<-0.36*a_A_AI2+(1-0.36)*a_A_AI3
+dat_UC<-dat_outcome
+df_UC<-df
+m_M_UC<-m_M_tunnels
+a_A_UC<-a_A_tunnels
+
+
+dat_outcome<-data.frame()
+m_M_tunnels<-0.319*m_M_AI2+(1-0.319)*m_M_AI3
+a_A_tunnels<-0.319*a_A_AI2+(1-0.319)*a_A_AI3
+dat_wocad<-dat_outcome
+df_wocad<-df
+m_M_wocad<-m_M_tunnels
+a_A_wocad<-a_A_tunnels
+
+dat_outcome<-data.frame()
+m_M_tunnels<-0.22*m_M_AI2+(1-0.22)*m_M_AI3
+a_A_tunnels<-0.22*a_A_AI2+(1-0.22)*a_A_AI3
+dat_wcad<-dat_outcome
+df_wcad<-df
+m_M_wcad<-m_M_tunnels
+a_A_wcad<-a_A_tunnels
+
+m_M_tunnels<-0.169148399*m_M_AI1+0.787959598*m_M_AI2+0.042892003*m_M_AI3
+a_A_tunnels<-0.169148399*a_A_AI1+0.787959598*a_A_AI2+0.042892003*a_A_AI3
+
+df_ai<-df
+m_M_ai<-m_M_tunnels
+a_A_ai<-a_A_tunnels
+
+up_cac<-psa_values$uptake_cac
+up_a<-psa_values$uptake_a
+
+agg_uc<-newlist_NS_AAC0$agg_outcome+newlist_NS_AAC1$agg_outcome
+agg_cac<-newlist_CAC_AAC0$agg_outcome+newlist_CAC_AAC1$agg_outcome
+agg_a<-newlist_All_AAC0$agg_outcome+newlist_All_AAC1$agg_outcome
+
+summary(agg_uc$CVD+agg_uc$MI+agg_uc$AG)*100
+summary(agg_uc$MI+agg_uc$AG)*10000
+summary(agg_uc$CVD)*10000
+summary(agg_uc$HIP+agg_uc$SCP)*10000
+summary(agg_uc$DCVD+agg_uc$DCHD)*10000
+summary(agg_uc$DHIP)*10000
+summary(agg_uc$DCVD+agg_uc$DCHD+agg_uc$D+agg_uc$DSAE+agg_uc$DHIP)*10000
+out_uc<-agg_uc
+
+agg<-agg_cac*up_cac+agg_uc*(1-up_cac)
+summary(agg$CVD+agg$MI+agg$AG)*100
+summary(agg$MI+agg$AG)*10000
+summary(agg$CVD)*10000
+summary(agg$HIP+agg$SCP)*10000
+summary(agg$DCVD+agg$DCHD)*10000
+summary(agg$DHIP)*10000
+summary(agg$DCVD+agg$DCHD+agg$D+agg$DSAE+agg$DHIP)*10000
+out_cac<-agg
+
+agg<-agg_a*up_a+agg_uc*(1-up_a)
+summary(agg$CVD+agg$MI+agg$AG)*100
+summary(agg$MI+agg$AG)*10000
+summary(agg$CVD)*10000
+summary(agg$HIP+agg$SCP)*10000
+summary(agg$DCVD+agg$DCHD)*10000
+summary(agg$DHIP)*10000
+summary(agg$DCVD+agg$DCHD+agg$D+agg$DSAE+agg$DHIP)*10000
+out_a<-agg
+
+df_ce_uc<-newlist_NS_AAC0$df_ce+newlist_NS_AAC1$df_ce
+cost_tr_uc<-df_ce_uc$Cost_Tr
+cost_hip_uc<-df_ce_uc$Cost_HIP
+cost_scp_uc<-df_ce_uc$Cost_SCP
+q_uc<-df_ce_uc$QALY
+lt_uc<-df_ce_uc$LYD
+cost_uc<-cost_tr_uc+cost_hip_uc+cost_scp_uc
+ 
+df_ce_cac<-newlist_CAC_AAC0$df_ce+newlist_CAC_AAC1$df_ce
+df_1<-df_ce_cac
+df_ce<-up_cac*df_ce_cac+(1-up_cac)*df_ce_uc
+df_ce$Cost_Test<-newlist_CAC_AAC0$df_ce$Cost_Test+newlist_CAC_AAC1$df_ce$Cost_Test
+cost_tr<-df_ce$Cost_Tr
+cost_hip<-df_ce$Cost_HIP
+cost_stn<-df_ce$Cost_Stn
+cost_al<-df_ce$Cost_AL
+df_ce$Cost<-df_ce$Cost_Test+df_ce$Cost_HIP+df_ce$Cost_Tr+df_ce$Cost_Stn+df_ce$Cost_AL+df_ce$Cost_SCP+df_ce$Cost_VD
+cost_cac<-df_ce$Cost
+q_cac<-df_ce$QALY
+lt_cac<-df_ce$LYD
+df_ce_cac<-df_ce
+
+df_ce_a<-newlist_All_AAC0$df_ce+newlist_All_AAC1$df_ce
+df_ce<-up_a*df_ce_a+(1-up_a)*df_ce_uc
+df_ce$Cost_Test<-newlist_All_AAC0$df_ce$Cost_Test+newlist_All_AAC1$df_ce$Cost_Test
+cost_tr<-df_ce$Cost_Tr
+cost_hip<-df_ce$Cost_HIP
+cost_stn<-df_ce$Cost_Stn
+df_ce$Cost<-df_ce$Cost_Test+df_ce$Cost_HIP+df_ce$Cost_Tr+df_ce$Cost_Stn++df_ce$Cost_SCP
+cost_a<-df_ce$Cost
+q_a<-df_ce$QALY
+lt_a<-df_ce$LYD
+df_ce_a<-df_ce
+
+summary(cost_cac-cost_uc)
+(cost_a-cost_cac)
+(q_cac-q_uc)*10000
+(-q_cac+q_a)*10000
+
+NS_Cost<-cost_uc
+CAC_Cost<-cost_cac
+All_Cost<-cost_a
+my_example_psa$cost<-data.frame(NS_Cost,CAC_Cost,All_Cost)
+
+NS_Eff<-q_uc
+CAC_Eff<-q_cac
+All_Eff<-q_a
+my_example_psa$effectiveness<-data.frame(NS_Eff,CAC_Eff,All_Eff)
+my_example_psa$parameters<-psa_values
+my_example_psa$strategies<-c("Treat None","AI AAC", "Treat All")
+
+############## https://cran.r-project.org/web/packages/dampack/vignettes/psa_analysis.html
+
+psa_obj <- make_psa_obj(cost = my_example_psa$cost,
+                        effectiveness = my_example_psa$effectiveness,
+                        parameters = my_example_psa$parameters,
+                        strategies = my_example_psa$strategies,
+                        currency = "$")
+
+plot(psa_obj)
+
+psa_sum <- summary(psa_obj, 
+                   calc_sds = TRUE)
+psa_sum
+
+icers <- calculate_icers(cost = psa_sum$meanCost, 
+                         effect = psa_sum$meanEffect, 
+                         strategies = psa_sum$Strategy)
+plot(icers)
+
+ceac_obj <- ceac(wtp = example_psa$wtp, 
+                 psa = psa_obj)
+head(ceac_obj)
+
+plot(ceac_obj, 
+     frontier = TRUE, 
+     points = TRUE)
+
