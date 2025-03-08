@@ -1,0 +1,537 @@
+##################################### Initial setup ###########################
+rm(list = ls())  # remove any variables in R's memory 
+library(dplyr)    # to manipulate data
+library(haven) 
+library(reshape2) # to transform data
+library(ggplot2)  # for nice looking plots
+library(scales)   # for dollar signs and commas
+# devtools::install_github("DARTH-git/dampack") # to install dampack form GitHub
+library(dampack)  # for CEA and calculate ICERs
+
+#### download requred packages and attach CEAutil package
+if(!require("remotes")) install.packages("remotes")
+if(!require("dplyr")) install.packages("dplyr")
+if(!require(dampack)) remotes::install_github("DARTH-git/dampack", dependencies = TRUE)
+if(!require("CEAutil")) remotes::install_github("syzoekao/CEAutil", dependencies = TRUE)
+
+## General setup
+# https://rdrr.io/github/syzoekao/CEAutil/f/inst/rmd/post_material.Rmd
+# https://cran.r-project.org/web/packages/dampack/vignettes/dsa_generation.html
+################################################################################
+
+n_age_init<-40  # age at baseline
+n_age_max<-100 # 100 # maximum age of follow 
+
+n_cycles<-(n_age_max-n_age_init) # time horizon, number of cycles
+cycle_length<-1
+
+########### Gender and Age-specific probability of dying when Healthy (all-cause mortality) ############################
+
+sex<-"Total"
+
+## Age-dependent mortality rates
+# lt_usa_2016 <- read.csv("CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/LifeTable_USA_total_2015.csv",na.strings=c("NA",""," "))
+
+# lt_usa_2016 <- read.table("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/LifeTable_USA_total_2020.R.txt",header=T,sep="\t")
+
+lt_usa_2016 <- read.table("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/LifeTable_USA_total_2017.R.txt",header=T,sep="\t")
+
+# lt_usa_2016 <- read.table("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/LifeTable_USA_total_2016.R.txt",header=T,sep="\t")
+
+# lt_usa_2016 <- read.table("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/LifeTable_USA_total_2000.txt",header=T,sep="\t")
+
+lt_usa_2016$Age<-seq(0,100,1)
+
+v_p_HDage<-lt_usa_2016 %>% dplyr::filter(Age>=n_age_init & Age<n_age_max) %>% dplyr::select(px_total) %>% as.matrix()
+
+# v_p_HDage<-lt_usa_2016 %>% dplyr::filter(Age>=n_age_init & Age<n_age_max) %>% dplyr::select(qx) %>% as.matrix()
+
+# lt_usa_2016$px_total<-lt_usa_2016$px
+# lt_usa_2016$Total<--log(1-lt_usa_2016$qx)
+
+v_p_HDage <-lt_usa_2016 %>% dplyr::filter(Age>=n_age_init & Age<n_age_max) %>% dplyr::select(px_total) %>% as.matrix()
+
+v_r_mort_by_age <- lt_usa_2016 %>% dplyr::filter(Age >= n_age_init & Age<n_age_max) %>% dplyr::select(Total) %>% as.matrix()
+
+v_r_HDage <- rep(v_r_mort_by_age, each = 1/cycle_length)
+
+hh<-1.0
+p_HDage<-v_p_HDage*hh
+
+
+########## baseline data #############
+data_uk<-readRDS("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/data_UKFSS.rds")
+mdat1<-read.csv("CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/mdat_us_population_2017.csv",header=T)
+mdat2<-read.csv("CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/mdat_us_population_2023.txt",header=T,sep="\t")
+mdat<-read.csv("CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/mdat_us_standardpopulation_2000_v0.csv",header=T)
+mdat3<-read.table("CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/mdat_us_population_2008.txt",header=T,sep="\t")
+mdat$n<-mdat$n1
+mdat$w2<-mdat[,"n"]/sum(mdat$n)
+
+
+### in the Prostate, Lung, Colorectal, and Ovarian (PLCO) Cancer Screening Trial,
+
+# psa_crc_model<-readRDS("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/psa_crc_model.rsd")
+
+psa_crc_model<-readRDS("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/psa_crc_model.rsd")
+
+# psa<-psa_crc_model$baseline_input_CTC_DoD_Sv5_40
+psa<-psa_crc_model$baseline_input_CTC_DoD_5_40
+# psa<-psa_crc_model$baseline_input_NS
+# psa<-psa_crc_model$baseline_input_mtsDNA_45
+
+psa$i_screen_max<-37
+psa$i_stop<-45
+psa$age_screen<-45
+psa$i_screen<-6
+psa$i_init<-6
+i_init<-psa$i_init
+age_init<-psa$age_screen
+psa$model<-2.0
+model<-psa$model
+
+psa$delay<-0
+psa$delay_end<-0
+psa$delta<-1.0 # 1/1.30
+
+# psa$sp<-0.95
+# psa$sp<-0.82
+# psa$se_dim<-0.10
+# psa$se_large<-0.60
+# psa$se_small<-0.65
+# psa$se_large<-0.65
+# psa$se_crc<-0.65
+# psa$se_crc<-0.94
+# psa$se_large<-0.58
+# psa$se_crc<-0.90
+# psa$se_large<-0.80
+# psa$se_crc<-0.88
+# psa$se_large<-0.88
+# psa$sp<-0.86
+# psa$se_small<-0.64
+# psa$se_crc<-1.00
+# psa$se_large<-0.64
+# psa$se_large<-0.84
+# psa$se_crc<-0.94
+psa$hazard_ratio<-1.0
+# psa$sp<-0.95
+# psa$se_small<-0.0
+# psa$sp<-0.97
+# psa$se_small<-0.42
+# psa$se_large<-0.85
+# psa$interval<-3
+# psa$se_large<-0.64
+# psa$se_crc<-0.64
+###############################
+
+psa_values<-psa
+
+# saveRDS(psa_crc_model,"/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/psa_crc_model.rsd")
+# saveRDS(data_pop,"/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/data_pop.rds") 
+##### incidence rate people without neoplasia
+
+tr.prob <- read.table("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/incidence.rates.prob.r.txt",header=T)
+
+tr.prob <- tr.prob %>% dplyr::filter(Age>=n_age_init)
+ir_1<-read.csv("CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/ir1_h.csv",header=T)
+
+data_pop<-readRDS("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/data_pop.rds")
+source("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/AGES_40/module.naturalhistory.R")
+source("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/AGES_40/module.ctc.sv.screening.45.R")
+source("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/AGES_40/module.cc.screening.45.R")
+source("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/AGES_40/module.ctc.screening.45.R")
+source("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/AGES_40/module.fit.screening.45.R") 
+source("/Users/correale/CEA_BRACCO_sDNA_CTC/RCODE/AGES_40/module.mtsdna.screening.45.R")
+
+################# Iinitial v_i #####################
+
+######### ###  cohorts of padtients with 10 years of follow-up
+#### base case scenario
+n_age<-n_age_init
+
+n_t<-n_cycles
+
+len<-length(n_age)
+
+n_tunnel_size <-n_cycles
+v_cycles_tunnel<-1:n_tunnel_size
+v_Sick_tunnel<-paste("Dim_", seq(1, n_tunnel_size), "Yr", sep = "")
+v_Sdim_tunnel<-paste("Sdim_", seq(1, n_tunnel_size), "Yr", sep = "")
+v_Svdim_tunnel<-paste("Svdim_", seq(1, n_tunnel_size), "Yr", sep = "")
+
+v_Sick_tunnel <-paste("Dim_", seq(1, 14), "Yr", sep = "")
+v_SL_tunnel <- paste("SL_", seq(1, 5), "Yr", sep = "")
+v_SR_tunnel <- paste("SR_", seq(1, 5), "Yr", sep = "")
+# v_names_states_tunnels <- c("H", v_Sick_tunnel, v_n[3:37])
+
+v_FU_HG<-paste("HG_", seq(1, 3), "Yr", sep = "")
+v_FU_LR<-paste("LR_", seq(1, 5), "Yr", sep = "")
+v_DCRC<-c("DL0","DR0","DD0")
+v_PreSL<-c("SL0","SL1","SL2","SL3","SL4")
+v_PreSR<-c("SR0","SR1","SR2","SR3","SR4")
+v_PreDC<-c("SD0","SD1")
+v_FUCTC<-c("FU_1Yr","FU_2Yr","FU_3Yr")
+v_CRC<-c("v_CL_2","v_CR_2","v_FU_12Yr","v_FU_22Yr")
+
+v_n<-c("H","Dim","LR","NPHG","HG","DA","CL","CR","DC","SympL","SympR","SympD","D","DL","DR","DD","SurvivalL","SurvivalR","SD_1Yr",v_Sick_tunnel,v_SL_tunnel,v_SR_tunnel, "Medium_Reg","Large_Reg",v_FU_HG,v_FU_LR,"Sdim",v_DCRC,v_PreSL,v_PreSR,v_PreDC,v_FUCTC,"NonAD",v_Sdim_tunnel,v_CRC,"FU_H",v_Svdim_tunnel)
+
+n_states <- length(v_n) # number of health states 
+
+v_1<-rep(0,n_states)
+v_is<-v_1
+names(v_is)<-v_n
+
+##### 0.13 62% small, 0.0793; 9% large, 0.0117; medium, 0.0390. 
+
+d_c <- 0.03 # discount rate for costs 
+d_e <- 0.03 # discount rate for QALYs
+
+d_wc<-0.03
+half<-1
+
+#################################################################
+#################################################################
+################# PSA distribution ################
+
+####### see function in the file a_P_function_CRC_ir_Zorzi_FIT.txt 
+############## No screeening ###########
+#### https://nordcan.iarc.fr/en/dataviz/trends?cancers=520&sexes=1_2&populations=208&years=1943_2020&types=3&key=total
+#########################################################
+## https://www.ncbi.nlm.nih.gov/books/NBK570821/#ch2.s5
+####### NS ####
+v_i<-v_is
+###########
+#### SIRM at age 40 distribution of adenoma 0.56 1-5 mm; 0.34 6-9 mm; 0.11 >9mm 
+########
+
+#### age 60
+
+v_i[]<-0
+v_i["Dim"]<-0.21
+v_i["Dim_1Yr"]<-0.14
+v_i["Dim_3Yr"]<-0.05
+v_i["CL"]<-0.00340 # 0.0018 0.00264
+v_i["CR"]<-0.00093 # 0.00158  0.0005
+v_i["DC"]<-0.00037 # 0.000451196 0.0002
+
+#### age 50
+
+v_i[]<-0.0
+v_i["Dim"]<-0.19
+v_i["Dim_1Yr"]<-0.124
+v_i["Dim_3Yr"]<-0.040
+v_i["CL"]<-0.0012
+v_i["CR"]<-0.00069
+v_i["DC"]<-0.00018
+
+## age 40 age
+v_i[]<-0
+v_i["Dim"]<-0.15
+v_i["Dim_1Yr"]<-0.08 # 0.084
+v_i["Dim_3Yr"]<-0.032
+v_i["CL"]<-0.51/1000
+v_i["CR"]<-0.46/1000
+v_i["DC"]<-0.09/1000
+
+## age 65 medicare
+v_i[]<-0
+v_i["Dim"]<-0.24 # 32 # 0.232 
+v_i["Dim_1Yr"]<-0.150
+v_i["Dim_3Yr"]<-0.055
+v_i["CL"]<-0.0044
+v_i["CR"]<-0.0016
+v_i["DC"]<-0.00058
+
+## age 45 age
+v_i[]<-0
+v_i["Dim"]<-0.16
+v_i["Dim_1Yr"]<-0.09
+v_i["Dim_3Yr"]<-0.028
+v_i["CL"]<-0.51/1000
+v_i["CR"]<-0.46/1000
+v_i["DC"]<-0.09/1000
+
+# v_i["CL"]<-0.55/100*0.90 # 0.57
+# v_i["CR"]<-0.55/100*(1-0.90) # 0.57
+# v_i["Dim_1Yr"]<-0.57 # 0.1-sum(v_i) # 0.57
+# v_i["Dim_10Yr"]<-1-sum(v_i) # 0.57 # 0.1-sum(v_i) # 0.57
+# v_i["Dim_3Yr"]<-0.0 # 0.047 # 0.03
+# v_i["CL"]<-0.90
+# v_i["CR"]<-(1-0.90)
+
+norm<-sum(v_i)
+ if(norm!=1)
+	v_i["H"]<-1-norm
+
+v_n_tunnels<-v_n
+n_states_tunnels <-length(v_n_tunnels)  
+
+v_s_init_tunnels<-v_i
+v_initial<-v_i
+v_s_init_tunnels<-v_i
+v_initial<-v_i
+
+N<-1
+
+dat_outcome<-data.frame()
+
+for(n_rep in 1:N){
+	      
+      psa_set<-psa_values[n_rep,]
+      Strategy<-psa_set$Strategy
+ 
+      df<-data.frame()
+      df_ce<-data.frame()
+
+      # Initialize 3-D array
+
+      if(Strategy=="NS"){
+	a_P_tunnels<-simulate_NoScreening(n_age_init,n_age_max,p_HDage,psa_set,tr.prob,ir_1)} else if(Strategy=="mtsDNA"){
+	a_P_tunnels<-simulate_SDNAScreening(n_age_init,n_age_max,p_HDage,psa_set,tr.prob,ir_1)} else if(Strategy=="FIT"){
+	a_P_tunnels<-simulate_FITScreening(n_age_init,n_age_max,p_HDage,psa_set,tr.prob,ir_1)} else if(Strategy=="CTCDoD"){
+	a_P_tunnels<-simulate_CTCScreening(n_age_init,n_age_max,p_HDage,psa_set,tr.prob,ir_1)} else if(Strategy=="CTCDoD5"){
+	a_P_tunnels<-simulate_CTCNewScreening(n_age_init,n_age_max,p_HDage,psa_set,tr.prob,ir_1)} else{
+	a_P_tunnels<-simulate_CCScreening(n_age_init,n_age_max,p_HDage,psa_set,tr.prob,ir_1)
+	}
+
+        a_P_tunnels<-a_P_tunnels[,,seq(i_init,n_t,1)]
+	
+       	n_t<-dim(a_P_tunnels)[3]
+	
+      a_A_tunnels<- array(0, dim = c(n_states_tunnels, n_states_tunnels, n_t + 1), dimnames = list(v_n_tunnels, v_n_tunnels, 0:n_t))
+
+# Set first slice of A with the initial state vector in its diagonal
+      diag(a_A_tunnels[, , 1]) <- v_s_init_tunnels
+
+      m_M_tunnels<-matrix(0, nrow = (n_t + 1), ncol = n_states_tunnels, dimnames = list(0:n_t, v_n_tunnels))
+
+      m_M_tunnels[1, ]<-v_s_init_tunnels
+
+      n_age_init<-age_init
+      
+      n_cycles<-(n_age_max-n_age_init) # time horizon, number of cycles
+      cycle_length<-1
+  	
+      for(t in 1:n_t){
+      # Fill in cohort trace
+      m_M_tunnels[t + 1, ] <- m_M_tunnels[t, ] %*% a_P_tunnels[, , t]
+      # Fill in tansition dynamics array
+      a_A_tunnels[, , t + 1]  <- m_M_tunnels[t, ] * a_P_tunnels[, , t]
+      }
+
+      df<-as.data.frame(m_M_tunnels)
+      df$Age<-seq(n_age_init,n_age_max,1)
+      alive<-v_n[c(-13,-14,-15,-16,-55,-56,-57)]
+      df$v_s_ad<-rowSums(df[,alive])
+      p_risk<-v_n[c(1:9,20:33,44,45,46:54,69:length(v_n))]
+      df$n_risk<-rowSums(df[,p_risk])
+      
+      v_symp<-v_n[c(10,11,12)]
+      df$Symp<-rowSums(df[,v_symp])
+
+      df$SympL<-df[,c("SympL")]
+      df$SympR<-df[,c("SympR")]
+      
+      df$prev_Dim<-df$Dim/df$v_s_ad
+      df$prev_Dim_1<-df$Dim_1Yr/df$v_s_ad
+      df$prev_Dim_2<-df$Dim_2Yr/df$v_s_ad
+      df$prev_Dim_3<-df$Dim_3Yr/df$v_s_ad
+      df$prev_Dim_6<-df$Dim_6Yr/df$v_s_ad
+      df$prev_NonAD<-df$NonAD/df$v_s_ad
+            
+      df$prev_Advanced<-rowSums(df[,c("Dim_3Yr","Dim_2Yr")])/df[,"v_s_ad"]
+      
+      adenoma<-c("Dim","Dim_1Yr","Dim_3Yr","Dim_2Yr","Dim_6Yr","Dim_4Yr")
+      df$prev_Adenoma<-rowSums(df[,adenoma])/df[,"v_s_ad"]
+
+      v_crc<-v_n[c(6,7,8,9)]
+      df$prev_CRC<-rowSums(df[,c(v_crc,v_FUCTC)])/df$v_s_ad 
+
+      df$prev_DA<-df$DA/df$v_s_ad
+      df$prev_CL<-df$CL/df$v_s_ad
+      df$prev_CR<-df$CR/df$v_s_ad
+      df$prev_DC<-df$DC/df$v_s_ad
+      
+      vec1<-df$DL
+      result <- vec1[1]     
+      for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+      df$DL<-result
+      
+      vec1<-df$DR
+      result <- vec1[1]     
+      for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+      df$DR<-result
+
+      vec1<-df$DD
+      result <- vec1[1]     
+      for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+      df$DD<-result
+
+      vec1<-df$DL0
+      result <- vec1[1]     
+      for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+      df$DL0<-result
+      
+      vec1<-df$DR0
+      result <- vec1[1]     
+      for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+      df$DR0<-result
+
+      vec1<-df$DD0
+      result <- vec1[1]     
+      for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+      df$DD0<-result
+
+      df$DeadL<-df$DL+df$DL0
+      df$DeadR<-df$DR+df$DR0
+      df$DeadD<-df$DD+df$DD0
+       
+      df$DeadCRC<-rowSums(df[,c("DL","DR","DD","DL0","DR0","DD0")])
+ #     vec1<-df$DDCRC
+ #     result <- vec1[1]     
+ #     for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+ #     df$DeadCRC<-result
+      
+      vec1<-df$D
+      result <- vec1[1]     
+      for (i in 2:length(vec1)) result <- append(result, vec1[i]-vec1[i-1])
+      df$DOther<-result      
+      df$n<-colSums(colSums(a_A_tunnels[p_risk,c(p_risk,"D",v_symp,"SL0","SR0","SD0"),]))
+      
+      aa<-df$Age
+     cohort<-ifelse(aa<5,"0-4",ifelse(aa<10, "5-9",ifelse(aa<15,"10-14",ifelse(aa<20,"15-19",ifelse(aa<25,"20-24",ifelse(aa<30,"25-29",ifelse(aa<35,"30-34",ifelse(aa<40,"35-39",ifelse(aa<45,"40-44",ifelse(aa<50,"45-49",ifelse(aa<55,"50-54",ifelse(aa<60,"55-59",ifelse(aa<65,"60-64",ifelse(aa<70,"65-69",ifelse(aa<75,"70-74",ifelse(aa<80,"75-79",ifelse(aa<85,"80-84","85+")))))))))))))))))
+
+
+df$cohort<-cohort
+
+	age_screen<-psa$age_screen
+	y<-rowSums(df[,c("DL","DR","DD")])
+#	y1<-rowSums(df[,c("DL0","DR0","DD0")])
+	df$y<-ifelse(df$Age>age_screen,y,0)
+
+	nn<-alive[c(-17,-18)]
+	df$nn<-rowSums(df[,nn])
+	
+#	somoza <- group_by(df,cohort) %>% summarize(symp=sum(Symp), n_risk=sum(n_risk),v_s_ad=sum(v_s_ad))
+#	somoza$IR<-round(somoza$symp/somoza$n_risk*100000,2)
+	
+#	somoza <- group_by(df,cohort) %>% summarize(symp=sum(SympL), n_risk=sum(n_risk))
+}
+
+df$event<-df$Symp
+df$n<-c(1,df[1:n_t,"n_risk"])
+xx<-df[2:(n_t+1),c("event","n","cohort","Age")]
+xx[,1:2]<-round(xx[,1:2]*100000)
+# xx[,1:2]<-round(xx[,1:2]*10000)
+
+# somoza <- group_by(tmp,cohort) %>% summarize(symp=sum(Symp), n=sum(start))
+# somoza <- group_by(df,cohort) %>% summarize(symp=sum(Symp), n=sum(n))
+
+somoza<-group_by(xx,cohort) %>% summarize(symp=sum(event), n=sum(n))
+somoza$Symp<-round(somoza$symp)
+somoza$n_risk<-round(somoza$n)
+somoza$event<-somoza$Symp
+somoza$n<-somoza$n_risk
+somoza$symp<-somoza$Symp
+
+# somoza<-tmp
+# somoza$event<-somoza$Symp
+# somoza$n_risk<-somoza$n
+
+mexp <- glm(event ~ cohort-1, offset=log(n), family=poisson, data=xx[1:60,])
+b<-exp(coef(mexp)) 
+     	 ci.lb<-exp(confint(mexp))
+      	 ci.ub<-exp(confint(mexp))
+	 
+builtin <- function() with(z, weighted.mean(count, size))
+rollyourown <- function() with(z, sum(count*size)/sum(count))
+
+# source("CEA_BRACCO_sDNA_CTC/RCODE/Rfunction.dampack.R")
+# source("CEA_BRACCO_sDNA_CTC/RCODE/Rfunction.dampack.R")
+# source("CEA_BRACCO_sDNA_CTC/RCODE/AGES_40/Rfunction.dampack.50.R")
+source("CEA_BRACCO_sDNA_CTC/RCODE/AGES_40/Rfunction.dampack.50.R")
+# source("CEA_BRACCO_sDNA_CTC/RCODE/AGES_40/Rfunction.dampack.65.R")
+
+aggregate_adenoma<-function(p1,p2,p3,data_dim,data_low,data_high){
+
+p<-p1+p2+p3
+p11<-0.265/p
+p21<-0.167/p
+
+m_M_dm<-data_dim$m_M_dim
+m_M_lw<-data_low$m_M_lw
+m_M_hg<-data_high$m_M_hg
+m_M_ad<-p11*m_M_dm+p21*m_M_lw+(1-p11-p21)*m_M_hg
+retunr(m_M_ad)
+}
+
+calc_events<-function(df,n_t){
+
+mdata<-df
+
+agg<-aggregate(data=mdata[2:(n_t+1),],Symp~cohort,FUN=sum)
+agg$SympL<-aggregate(data=mdata[1:(n_t+1),],SympL~cohort,FUN=sum)[,"SympL"]
+agg$SympR<-aggregate(data=mdata[1:(n_t+1),],SympR~cohort,FUN=sum)[,"SympR"]
+agg$SympD<-aggregate(data=mdata[1:(n_t+1),],SympD~cohort,FUN=sum)[,"SympD"]
+agg$y<-aggregate(data=mdata[1:(n_t+1),],y~cohort,FUN=sum)[,"y"]
+
+agg1<-aggregate(data=mdata[1:(n_t+1),],n_risk~cohort,FUN=sum)
+agg1$v_s_ad<-aggregate(data=mdata[1:n_t+1,],v_s_ad~cohort,FUN=sum)[,"v_s_ad"]
+agg1$nn<-aggregate(data=mdata[1:n_t+1,],nn~cohort,FUN=sum)[,"nn"]
+
+agg<-merge(agg,agg1,by="cohort",all.x=TRUE)
+
+return(agg)
+}
+
+somoza$event<-somoza$symp
+somoza$n<-somoza$n_risk
+
+glm_poisson_prediction<-function(somoza,prediction,mdat){
+
+db<-somoza
+db$event<-db$symp
+db$n<-db$n_risk
+
+	if(prediction==1){
+	   newdb<-mdat
+	   } else{
+	   newdb<-db	
+		}
+		
+        mdat$cohort<-paste(mdat$cohort)
+
+	mexp<-glm(data=db,event~cohort-1+offset(log(n)),family="poisson")
+
+	glm1<-mexp	
+	ginv <- glm1$family$linkinv  ## inverse link function
+	prs <- predict(glm1, newdata = newdb, type = "link", se.fit=TRUE)
+      	pred <- ginv(prs[[1]])
+      	lo <- ginv(prs[[1]] - 1.96 * prs[[2]])
+      	up <- ginv(prs[[1]] + 1.96 * prs[[2]])
+	
+	 b<-exp(coef(mexp))
+      	 ci.lb<-exp(confint(mexp))
+      	 ci.ub<-exp(confint(mexp))
+	 out<-data.frame(b=b,ci.lb=ci.lb,pred=pred,lo=lo,up=up)
+	 return(out)
+}
+     
+# somoza <- group_by(df,cohort) %>% summarize(symp=sum(Symp), n_risk=sum(n_risk))
+
+# mdat<-read.table("CEA_BRACCO_sDNA_CTC/RCODE/DATA-R/mdat_us_standardpopulation_2000_v0.txt",header=T)
+
+# somoza$event<-somoza$symp
+# somoza$n<-somoza$n_risk
+
+# out<-glm_poisson_prediction(somoza,1,mdat)
+
+#### Brettaheur
+# nfu_1<-c(56365,55375,54192,52819,47769,37313) ## -usual care
+# nfu_2<-c(11843,11720,11597,11443,10443,7522)
+
+# pnn<-(11843+11720)/11843+(11843+11720+11597)/(11843+11720)+(11843+11720+11597+11443)/(11843+11720+11597)+(11843+11720+11597+11443+10443)/(11843+11720+11597+11443)+(11843+11720+11597+11443+10443+7522)/(11843+11720+11597+11443+7522)
+
+# pnn1<-(56365+55375)/56365+(56365+55375+54192)/(56365+55375)+(56365+55375+54192+52819)/(56365+55375+54192)+(56365+55375+54192+52819+47769)/(56365+55375+54192+52819)+(56365+55375+54192+52819+47769+37313)/(56365+55375+54192+52819+47769)
+
+### Atkins 112939 control group; Screened (n=40b
