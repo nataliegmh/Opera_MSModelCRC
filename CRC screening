@@ -1,0 +1,36 @@
+# r_HD[t]<--log(1-p_HDage[t])
+# p_D_1[t] <-1-exp(-r_HD[t]*rr_1) relative risk
+# https://github.com/FredHutch/IC-RISC-Working/tree/master/input_data
+
+RateToProb <- function(r, t) {
+ # Function to convert rates to probabilities
+ # Arg:
+ # r: the annual input rate
+ # t: the cycle length of your model in years
+ #
+ # Retrun:
+ # probability for the time interval
+ 1 - exp(-r * t)
+}
+
+probtoodds<-function(x){
+# Function to convert probabilities to odds
+ # Arg:
+ # x: probability
+ x/(1-x)
+}
+
+oddstoprob<-function(x){
+ # Function to convert odds to probability
+ # Arg:
+ # x: odds
+ x/(x+1)
+}
+
+a_P_function_CRC_Wieszczy_sc<-function(n_age_init,n_age_max,p_hdage,psa){
+
+p_HDage<-p_hdage
+Strategy<-psa$Strategy
+
+
+################# patients with nonadvanced adenoma at baseline have a 10-year cumulative CRC incidence and mortality of 0.44b
