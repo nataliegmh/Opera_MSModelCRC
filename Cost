@@ -1,0 +1,773 @@
+#### CADe cost-effectiveness analysis ####
+# Order: packages -> inputs/helpers -> main analysis -> OWSA -> MWSA -> tables -> Excel
+
+#### 0) PACKAGES ####
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(purrr)
+  library(tidyr)
+  library(tibble)
+  library(scales)
+  library(writexl)
+  library(ggplot2)
+})
+
+options(dplyr.summarise.inform = FALSE)
+
+#### 1) HELPERS ####
+safe_divide <- function(num, den) {
+  ifelse(is.na(den) | den <= 0, NA_real_, num / den)
+}
+
+fmt_dollar_na <- function(x, accuracy = 1) {
+  ifelse(is.na(x), "N/A", scales::dollar(x, accuracy = accuracy))
+}
+
+#### 2) INPUTS ####
+
+## 2a) README (sheet descriptions)
+readme_tbl <- tribble(
+  ~Sheet, ~Description,
+  "Baseline", "Discounted device (annualized) + follow-ups; outcomes include CRC incidence and death prevented and cost-per-case.",
+  "One_way", "One-way sensitivity: (a) operational drivers, (b) CRC incidence/death ARR CIs, (c) Additional follow-up colonoscopies (per 10k) 95% CI from article. 'N/A' means ARR <= 0 (no cases prevented).",
+  "FU_guideline", "Adds article-based DeltaHigh (US-MSTF/ESGE) to each scenario baseline additional follow-ups per 10k (low-risk FU unchanged). Shows Baseline FU, DeltaHigh, and Total FU.",
+  "Multi_way", "Multi-way grid crossing operational ranges (incl. discount) with incidence and death risk CIs (with/without CADe).",
+  "MWSA_CostOnly_BestWorst_CRC", "Best/worst cost per CRC prevented when varying cost variables only (device cost, FU cost, discount, volume, lifespan); risks and FU counts held at baseline.",
+  "CEA_CRC_cost_ratio", "Sub-analysis: cost-to-CRC-savings ratio using discounted program costs and undiscounted CRC savings (per your formula).",
+  "CEA_CRC_cost_ratio_fmt", "Formatted version of cost-to-savings ratio sheet for Word.",
+  "CEA_CRC_expansions", "Expanded CEA including CRC treatment cost savings, additional polypectomy+histopathology, and CO2 monetisation (PV).",
+  "CEA_polyp_OWSA", "OWSA on polyp-cost term: vary COSTpol and ΔPPC ranges; report cost per CRC/death prevented.",
+  "Environmental", "Device + follow-up carbon footprint and carbon cost; follow-up counts use each scenario baseline additional follow-ups per 10k."
+)
+
+## 2b) Core scenarios (baseline inputs)
+scenarios <- list(
+  list(
+    name = "Screening colonoscopy",
+    # Costs
+    device_cost = 37238, annual_volume = 1000, life_years = 10, discount = 0.03,
+    fu_per10k = 835, fu_cost = 950,
+    # Effects: absolute risks
+    inc_no = 0.0082, inc_no_lo = 0.0067, inc_no_hi = 0.0100,
+    inc_with = 0.0071, inc_with_lo = 0.0057, inc_with_hi = 0.0088,
+    death_no = 0.0015, death_no_lo = 0.0010, death_no_hi = 0.0024,
+    death_with = 0.0013, death_with_lo = 0.0008, death_with_hi = 0.0021
+  ),
+  list(
+    name = "FIT-positive colonoscopy",
+    # Costs
+    device_cost = 37238, annual_volume = 1000, life_years = 10, discount = 0.03,
+    fu_per10k = 108, fu_cost = 950,
+    # Effects: absolute risks
+    inc_no = 0.0582, inc_no_lo = 0.0560, inc_no_hi = 0.0608,
+    inc_with = 0.0577, inc_with_lo = 0.0558, inc_with_hi = 0.0595,
+    death_no = 0.0073, death_no_lo = 0.0068, death_no_hi = 0.0080,
+    death_with = 0.0072, death_with_lo = 0.0065, death_with_hi = 0.0080
+  )
+)
+
+## 2c) OWSA ranges (operational)
+operational_sens <- tribble(
+  ~parameter, ~field, ~low, ~high,
+  "Annual colonoscopies per CADe", "annual_volume", 500, 1500,
+  "Device lifespan (years)", "life_years", 5, 15,
+  "Discount rate", "discount", 0.00, 0.05,
+  "Surveillance colonoscopy cost", "fu_cost", 100, 1800,
+  "CADe purchase cost", "device_cost", 25896, 50373
+)
+
+## 2d) OWSA risk CIs expressed as ARR (delta between no-CADe and CADe)
+arr_ci <- tribble(
+  ~ScenarioName, ~Delta_inc_lo, ~Delta_inc_hi, ~Delta_death_lo, ~Delta_death_hi,
+  "Screening colonoscopy", -0.0021, 0.0043, -0.0011, 0.0017,
+  "FIT-positive colonoscopy", -0.0015, 0.0033, -0.0010, 0.0011
+)
+
+## 2e) OWSA additional follow-ups (per 10,000), 95% CI (from article)
+fu_ci_counts <- tribble(
+  ~ScenarioName,               ~FU_lo, ~FU_hi,
+  "Screening colonoscopy",         719,    952,
+  "FIT-positive colonoscopy",       64,    151
+)
+
+fu_grid_for <- function(scn_name, baseline) {
+  if (scn_name == "Screening colonoscopy") c(low = 719, baseline = baseline, high = 952)
+  else if (scn_name == "FIT-positive colonoscopy") c(low = 64, baseline = baseline, high = 151)
+  else c(baseline = baseline)
+}
+
+## 2f) Guideline-based DeltaHigh add-on (used in FU_guideline sheet)
+# These values match the output you already generated (US-MSTF: 180/650/1130; ESGE: 80/300/530).
+guideline_fu <- tribble(
+  ~Guideline, ~Case,      ~Delta_FU_per10k,
+  "US-MSTF",  "Low",                 180,
+  "US-MSTF",  "Baseline",            650,
+  "US-MSTF",  "High",               1130,
+  "ESGE",     "Low",                  80,
+  "ESGE",     "Baseline",            300,
+  "ESGE",     "High",                530
+)
+
+## 2g) CRC treatment cost (used in CRC-savings ratio + expansions)
+cost_crc_local <- 55352
+
+## 2h) Polypectomy + histopathology + CO2 assumptions (incremental due to CADe adoption)
+cost_polyp_local <- 287   # USD per additional polyp removed (marginal)
+# Social cost of carbon (EPA SC-CO2), USD/tonne -> USD/kg
+scc_tonne_range <- c(min = 120, mean = 190, max = 340)
+cost_co2_range  <- scc_tonne_range / 1000          # USD per kg CO2
+cost_co2_local  <- cost_co2_range["mean"]
+# Colonoscopy footprint incl. transport (kg CO2e per procedure)
+colonoscopy_co2e_range <- c(min = 18.09, mean = 28.4, max = 56.4)
+colonoscopy_co2e_local <- colonoscopy_co2e_range["mean"]
+# Device-related emissions per CADe-assisted colonoscopy (proxy from CADx)
+cade_device_co2e_range <- c(min = 0.23, mean = (0.23 + 0.31)/2, max = 0.31)  # mean=0.27
+cade_device_co2e_local <- cade_device_co2e_range["mean"]
+
+## 2i) Environmental constants (matched to your Environmental sheet)
+device_cf         <- 3963     # kg CO2e (device manufacturing footprint, allocated as a lump)
+followup_cf       <- colonoscopy_co2e_local   # kg CO2e per additional follow-up colonoscopy (transport included)
+carbon_cost_epa   <- scc_tonne_range["mean"]   # keep for table display
+carbon_cost_eu    <- 68.83                    # keep if you still want EU line in the Environmental sheet
+
+## 2j) Ranges for best/worst expansions
+cost_crc_range <- c(min = 0.8 * cost_crc_local, mean = cost_crc_local, max = 1.2 * cost_crc_local)
+
+#### 3) MAIN ANALYSIS FUNCTION ####
+analyse <- function(sc) {
+  yrs <- seq_len(sc$life_years)
+  tot_cols <- sc$annual_volume * sc$life_years
+  annual_fu <- (sc$fu_per10k / 1e4) * sc$annual_volume
+  
+  # PV costs: device annualized evenly across life_years, then discounted
+  pv_device   <- sum((sc$device_cost / sc$life_years) / (1 + sc$discount)^yrs)
+  pv_followup <- sum(annual_fu * sc$fu_cost / (1 + sc$discount)^yrs)
+  total_cost  <- pv_device + pv_followup
+  
+  # Absolute risk reductions (truncate at 0)
+  arr_inc   <- pmax(sc$inc_no   - sc$inc_with,   0)
+  arr_death <- pmax(sc$death_no - sc$death_with, 0)
+  
+  # prevented cases over horizon (undiscounted counts)
+  crc_prevented   <- arr_inc   * tot_cols
+  death_prevented <- arr_death * tot_cols
+  
+  tibble(
+    Scenario = sc$name,
+    device_cost = sc$device_cost,
+    annual_volume = sc$annual_volume,
+    life_years = sc$life_years,
+    discount = sc$discount,
+    fu_cost = sc$fu_cost,
+    fu_per10k = sc$fu_per10k,
+    risk_inc_no = sc$inc_no, risk_inc_with = sc$inc_with,
+    risk_death_no = sc$death_no, risk_death_with = sc$death_with,
+    pv_device = pv_device,
+    pv_followup = pv_followup,
+    total_cost = total_cost,
+    arr_incidence = arr_inc,
+    arr_death = arr_death,
+    crc_prevented = crc_prevented,
+    death_prevented = death_prevented,
+    cost_per_crc_prevented = safe_divide(total_cost, crc_prevented),
+    cost_per_death_prevented = safe_divide(total_cost, death_prevented),
+    fee_per_case = safe_divide(pv_device, tot_cols)
+  )
+}
+
+#### 4) BASELINE ####
+baseline_tbl <- map_dfr(scenarios, analyse)
+
+#### 5) ONE-WAY SENSITIVITY (OWSA) ####
+
+## 5a) operational drivers
+owsa_operational <- map_dfr(scenarios, function(sc0) {
+  map_dfr(seq_len(nrow(operational_sens)), function(i) {
+    row <- operational_sens[i, ]
+    map2_dfr(c(row$low, row$high), c("Low", "High"), function(val, tag) {
+      sc_mod <- sc0; sc_mod[[row$field]] <- val
+      analyse(sc_mod) %>%
+        transmute(
+          Scenario,
+          Parameter = row$parameter,
+          Case = tag,
+          Value = val,
+          `Total cost per CRC prevented`       = fmt_dollar_na(cost_per_crc_prevented, 1),
+          `Total cost per CRC death prevented` = fmt_dollar_na(cost_per_death_prevented, 1)
+        )
+    })
+  })
+})
+
+## 5b) risk ARR CIs
+compute_ce_for_delta <- function(sc0, delta_inc = NULL, delta_death = NULL) {
+  sc_mod <- sc0
+  if (!is.null(delta_inc)) {
+    sc_mod$inc_with <- pmax(sc0$inc_no - delta_inc, 0)
+  }
+  if (!is.null(delta_death)) {
+    sc_mod$death_with <- pmax(sc0$death_no - delta_death, 0)
+  }
+  analyse(sc_mod)
+}
+
+owsa_risk <- map_dfr(scenarios, function(sc0) {
+  r <- dplyr::filter(arr_ci, ScenarioName == sc0$name)
+  if (nrow(r) == 0) return(tibble())
+  r <- r[1, ]
+  bind_rows(
+    compute_ce_for_delta(sc0, delta_inc = r$Delta_inc_lo) %>%
+      transmute(Scenario = sc0$name, Parameter = "ARR: CRC incidence", Case = "Low (CI)", Value = r$Delta_inc_lo,
+                `Total cost per CRC prevented`       = fmt_dollar_na(cost_per_crc_prevented, 1),
+                `Total cost per CRC death prevented` = fmt_dollar_na(cost_per_death_prevented, 1)),
+    compute_ce_for_delta(sc0, delta_inc = r$Delta_inc_hi) %>%
+      transmute(Scenario = sc0$name, Parameter = "ARR: CRC incidence", Case = "High (CI)", Value = r$Delta_inc_hi,
+                `Total cost per CRC prevented`       = fmt_dollar_na(cost_per_crc_prevented, 1),
+                `Total cost per CRC death prevented` = fmt_dollar_na(cost_per_death_prevented, 1)),
+    compute_ce_for_delta(sc0, delta_death = r$Delta_death_lo) %>%
+      transmute(Scenario = sc0$name, Parameter = "ARR: CRC death", Case = "Low (CI)", Value = r$Delta_death_lo,
+                `Total cost per CRC prevented`       = fmt_dollar_na(cost_per_crc_prevented, 1),
+                `Total cost per CRC death prevented` = fmt_dollar_na(cost_per_death_prevented, 1)),
+    compute_ce_for_delta(sc0, delta_death = r$Delta_death_hi) %>%
+      transmute(Scenario = sc0$name, Parameter = "ARR: CRC death", Case = "High (CI)", Value = r$Delta_death_hi,
+                `Total cost per CRC prevented`       = fmt_dollar_na(cost_per_crc_prevented, 1),
+                `Total cost per CRC death prevented` = fmt_dollar_na(cost_per_death_prevented, 1))
+  )
+})
+
+## 5c) additional follow-ups CI
+owsa_fu <- map_dfr(scenarios, function(sc0) {
+  r <- dplyr::filter(fu_ci_counts, ScenarioName == sc0$name)
+  if (nrow(r) == 0) return(tibble())
+  vals <- c(`Low (CI)` = r$FU_lo[1], `High (CI)` = r$FU_hi[1])
+  imap_dfr(vals, function(v, tag) {
+    sc_mod <- sc0; sc_mod$fu_per10k <- v
+    analyse(sc_mod) %>%
+      transmute(
+        Scenario,
+        Parameter = "Additional follow-ups (per 10k)",
+        Case = tag,
+        Value = v,
+        `Total cost per CRC prevented`       = fmt_dollar_na(cost_per_crc_prevented, 1),
+        `Total cost per CRC death prevented` = fmt_dollar_na(cost_per_death_prevented, 1)
+      )
+  })
+})
+
+sens_tbl <- bind_rows(owsa_operational, owsa_risk, owsa_fu)
+
+#### 6) MULTI-WAY SENSITIVITY (MWSA) ####
+
+## 6a) operational value sets (low, baseline, high); discount grid 0–5% by 1%
+baseline_oper_vals <- stats::setNames(
+  unlist(scenarios[[1]][operational_sens$field]),
+  operational_sens$field
+)
+
+oper_values <- map2(
+  operational_sens$field,
+  seq_len(nrow(operational_sens)),
+  function(field, i) c(
+    low = operational_sens$low[i],
+    baseline = baseline_oper_vals[[field]],
+    high = operational_sens$high[i]
+  )
+) |> set_names(operational_sens$field)
+
+oper_values[["discount"]] <- seq(0, 0.05, by = 0.01)
+
+## 6b) cross operational sets with risk CIs and FU counts
+multiway_tbl <- map_dfr(scenarios, function(sc0) {
+  risk_values <- list(
+    inc_no     = c(low = sc0$inc_no_lo,     baseline = sc0$inc_no,     high = sc0$inc_no_hi),
+    inc_with   = c(low = sc0$inc_with_lo,   baseline = sc0$inc_with,   high = sc0$inc_with_hi),
+    death_no   = c(low = sc0$death_no_lo,   baseline = sc0$death_no,   high = sc0$death_no_hi),
+    death_with = c(low = sc0$death_with_lo, baseline = sc0$death_with, high = sc0$death_with_hi)
+  )
+  fu_values <- fu_grid_for(sc0$name, sc0$fu_per10k)
+  full_grid <- tidyr::crossing(
+    !!!oper_values,
+    !!!risk_values,
+    fu_per10k = fu_values
+  ) %>%
+    mutate(.row_id = row_number()) %>%
+    relocate(.row_id)
+  n_tot <- nrow(full_grid)
+  message("Scenario: ", sc0$name, " | full_grid rows: ", n_tot)
+  purrr::pmap_dfr(
+    full_grid,
+    function(.row_id, ...) {
+      if (.row_id %% 1000L == 0L || .row_id == n_tot) {
+        message("  -> ", sc0$name, ": row ", .row_id, " / ", n_tot)
+      }
+      analyse(modifyList(sc0, list(...)))
+    }
+  )
+})
+
+## 6c) cost-only best/worst for cost per CRC prevented
+op_low  <- function(field) operational_sens$low [operational_sens$field == field][1]
+op_high <- function(field) operational_sens$high[operational_sens$field == field][1]
+
+mw_costonly_bestworst_crc <- function(mw_tbl, scenarios_list) {
+  map_dfr(scenarios_list, function(sc0) {
+    df <- mw_tbl %>%
+      filter(
+        Scenario == sc0$name,
+        risk_inc_no     == sc0$inc_no,
+        risk_inc_with   == sc0$inc_with,
+        risk_death_no   == sc0$death_no,
+        risk_death_with == sc0$death_with,
+        fu_per10k       == sc0$fu_per10k
+      )
+    if (!nrow(df)) return(tibble())
+    
+    best_row <- df %>%
+      filter(
+        device_cost   == op_low("device_cost"),
+        fu_cost       == op_low("fu_cost"),
+        discount      == op_high("discount"),
+        annual_volume == op_high("annual_volume"),
+        life_years    == op_high("life_years")
+      ) %>%
+      slice_min(cost_per_crc_prevented, n = 1, with_ties = FALSE)
+    
+    worst_row <- df %>%
+      filter(
+        device_cost   == op_high("device_cost"),
+        fu_cost       == op_high("fu_cost"),
+        discount      == op_low("discount"),
+        annual_volume == op_low("annual_volume"),
+        life_years    == op_low("life_years")
+      ) %>%
+      slice_max(cost_per_crc_prevented, n = 1, with_ties = FALSE)
+    
+    pack <- function(row, label) {
+      row %>%
+        transmute(
+          Scenario,
+          Case = label,
+          Outcome = "Cost per CRC prevented",
+          Value_num = cost_per_crc_prevented,
+          Value = fmt_dollar_na(cost_per_crc_prevented, 1),
+          `Annual volume` = annual_volume,
+          `Life years` = life_years,
+          `Discount` = paste0(round(discount * 100, 1), "%"),
+          `CADe cost` = scales::dollar(device_cost, 1),
+          `FU cost` = scales::dollar(fu_cost, 1)
+        )
+    }
+    
+    bind_rows(
+      pack(best_row,  "Best (cost-only)"),
+      pack(worst_row, "Worst (cost-only)")
+    )
+  })
+}
+
+mw_costonly_bw_crc <- mw_costonly_bestworst_crc(multiway_tbl, scenarios)
+
+#### 7) GUIDELINE FU TABLE ####
+sens_fu_guideline <- map_dfr(scenarios, function(sc0) {
+  map_dfr(seq_len(nrow(guideline_fu)), function(i) {
+    row <- guideline_fu[i, ]
+    sc_mod <- sc0
+    sc_mod$fu_per10k <- sc0$fu_per10k + row$Delta_FU_per10k
+    analyse(sc_mod) %>%
+      transmute(
+        Scenario,
+        Guideline = row$Guideline,
+        Parameter = "Baseline FU per 10k + DeltaHigh",
+        Case = row$Case,
+        Baseline_FU_per10k = sc0$fu_per10k,
+        Delta_FU_per10k = row$Delta_FU_per10k,
+        Total_FU_per10k = sc_mod$fu_per10k,
+        `Total cost per CRC prevented`       = fmt_dollar_na(cost_per_crc_prevented, 1),
+        `Total cost per CRC death prevented` = fmt_dollar_na(cost_per_death_prevented, 1)
+      )
+  })
+})
+
+#### 8) CRC COST RATIO (your formula: discounted program cost / undiscounted CRC savings) ####
+cea_crc_ratio_tbl <- baseline_tbl %>%
+  transmute(
+    Scenario,
+    COST_crc = cost_crc_local,
+    Total_cost_PV = total_cost,
+    CRC_prevented = crc_prevented,
+    Savings_undisc = CRC_prevented * COST_crc,
+    Cost_to_Savings_Ratio = safe_divide(Total_cost_PV, Savings_undisc)
+  )
+
+cea_crc_ratio_fmt <- cea_crc_ratio_tbl %>%
+  mutate(
+    COST_crc = dollar(COST_crc, 1),
+    Total_cost_PV = dollar(Total_cost_PV, 1),
+    Savings_undisc = dollar(Savings_undisc, 1),
+    `Cost-to-savings ratio` = ifelse(is.na(Cost_to_Savings_Ratio), "N/A",
+                                     scales::number(Cost_to_Savings_Ratio, accuracy = 0.001))
+  ) %>%
+  select(-Cost_to_Savings_Ratio)
+
+#### 9) EXPANDED CEA: treatment savings, polyp cost, CO2 cost ####
+delta_ppc_tbl <- tibble(
+  Scenario = c("Screening colonoscopy", "FIT-positive colonoscopy"),
+  delta_ppc = c(0.35, 0.35)
+)
+
+cea_crc_expansions_tbl <- baseline_tbl %>%
+  left_join(delta_ppc_tbl, by = "Scenario") %>%
+  rowwise() %>%
+  mutate(
+    df = sum(1 / (1 + discount)^seq_len(life_years)),
+    # PV terms (same horizon/discounting convention as the program costs)
+    pv_crc_savings = cost_crc_local   * arr_incidence * annual_volume * df,
+    pv_polyp       = cost_polyp_local * delta_ppc     * annual_volume * df,
+    # additional follow-ups induced by CADe (per year)
+    annual_fu = (fu_per10k / 1e4) * annual_volume,
+    # Incremental CO2 due to CADe adoption:
+    #  (1) device-use emissions on all baseline CADe colonoscopies
+    #  (2) emissions from additional follow-up colonoscopies induced by CADe
+    pv_co2 = cost_co2_local * (annual_volume * cade_device_co2e_local +
+                                 annual_fu * colonoscopy_co2e_local) * df,
+    cost_per_crc_prevented_treatment =
+      safe_divide(pv_device + pv_followup - pv_crc_savings, crc_prevented),
+    cost_per_crc_prevented_polyp =
+      safe_divide(pv_device + pv_followup + pv_polyp, crc_prevented),
+    cost_per_crc_prevented_co2 =
+      safe_divide(pv_device + pv_followup + pv_co2, crc_prevented),
+    cost_per_crc_prevented_all =
+      safe_divide(pv_device + pv_followup + pv_polyp + pv_co2 - pv_crc_savings, crc_prevented)
+  ) %>%
+  ungroup() %>%
+  select(
+    Scenario,
+    cost_per_crc_prevented_treatment,
+    cost_per_crc_prevented_polyp,
+    cost_per_crc_prevented_co2,
+    cost_per_crc_prevented_all
+  )
+
+cea_crc_expansions_fmt <- cea_crc_expansions_tbl %>%
+  mutate(across(starts_with("cost_per_crc_prevented"), ~ fmt_dollar_na(.x, accuracy = 1)))
+
+#### 9b) EXPANDED ANALYSIS FUNCTION FOR STEPWISE MIN–MAX + BEST/WORST ####
+analyse_expanded <- function(sc,
+                             cost_crc   = cost_crc_local,
+                             cost_polyp = cost_polyp_local,
+                             delta_ppc  = 0.35,
+                             cost_co2   = cost_co2_local,
+                             colonoscopy_co2e = colonoscopy_co2e_local,
+                             cade_device_co2e = cade_device_co2e_local) {
+  base <- analyse(sc)
+  df <- sum(1 / (1 + sc$discount)^seq_len(sc$life_years))
+  V  <- sc$annual_volume
+  annual_fu <- (sc$fu_per10k / 1e4) * sc$annual_volume
+  
+  pv_crc_savings <- cost_crc   * base$arr_incidence * V * df
+  pv_polyp       <- cost_polyp * delta_ppc          * V * df
+  # Incremental CO2 due to CADe adoption (device-use + additional FU)
+  pv_co2 <- cost_co2 * (V * cade_device_co2e + annual_fu * colonoscopy_co2e) * df
+  
+  pv_device   <- base$pv_device
+  pv_followup <- base$pv_followup
+  
+  # cumulative PV costs by step
+  pv_step1 <- pv_device
+  pv_step2 <- pv_device + pv_followup
+  pv_step3 <- pv_device + pv_followup - pv_crc_savings
+  pv_step4 <- pv_device + pv_followup - pv_crc_savings + pv_polyp
+  pv_step5 <- pv_device + pv_followup - pv_crc_savings + pv_polyp + pv_co2
+  
+  tibble(
+    Scenario = sc$name,
+    crc_prevented = base$crc_prevented,
+    c1 = safe_divide(pv_step1, base$crc_prevented),
+    c2 = safe_divide(pv_step2, base$crc_prevented),
+    c3 = safe_divide(pv_step3, base$crc_prevented),
+    c4 = safe_divide(pv_step4, base$crc_prevented),
+    c5 = safe_divide(pv_step5, base$crc_prevented)
+  )
+}
+
+#### 9c) BEST/WORST CASE (expanded, includes CRC cost + polyp + environmental) ####
+expanded_bestworst_tbl <- map_dfr(scenarios, function(sc0) {
+  dev_lo <- op_low("device_cost"); dev_hi <- op_high("device_cost")
+  fu_lo  <- op_low("fu_cost");     fu_hi  <- op_high("fu_cost")
+  vol_lo <- op_low("annual_volume"); vol_hi <- op_high("annual_volume")
+  life_lo <- op_low("life_years");   life_hi <- op_high("life_years")
+  disc_lo <- op_low("discount");     disc_hi <- op_high("discount")
+  
+  grid <- tidyr::crossing(
+    device_cost   = c(dev_lo, dev_hi),
+    fu_cost       = c(fu_lo, fu_hi),
+    annual_volume = c(vol_lo, vol_hi),
+    life_years    = c(life_lo, life_hi),
+    discount      = c(disc_lo, disc_hi),
+    cost_crc      = c(cost_crc_range["min"], cost_crc_range["max"]),
+    cost_polyp    = c(polyp_cost_range["min"], polyp_cost_range["max"]),
+    delta_ppc     = c(delta_ppc_range["min"],  delta_ppc_range["max"]),
+    cost_co2          = c(cost_co2_range["min"], cost_co2_range["max"]),
+    colonoscopy_co2e  = c(colonoscopy_co2e_range["min"], colonoscopy_co2e_range["max"]),
+    cade_device_co2e  = c(cade_device_co2e_range["min"], cade_device_co2e_range["max"])
+  )
+  
+  res <- pmap_dfr(grid, function(device_cost, fu_cost, annual_volume, life_years, discount,
+                                 cost_crc, cost_polyp, delta_ppc,
+                                 cost_co2, colonoscopy_co2e, cade_device_co2e) {
+    sc_mod <- sc0
+    sc_mod$device_cost   <- device_cost
+    sc_mod$fu_cost       <- fu_cost
+    sc_mod$annual_volume <- annual_volume
+    sc_mod$life_years    <- life_years
+    sc_mod$discount      <- discount
+    
+    analyse_expanded(sc_mod,
+                     cost_crc = cost_crc,
+                     cost_polyp = cost_polyp,
+                     delta_ppc = delta_ppc,
+                     cost_co2 = cost_co2,
+                     colonoscopy_co2e = colonoscopy_co2e,
+                     cade_device_co2e = cade_device_co2e) %>%
+      mutate(
+        device_cost = device_cost, fu_cost = fu_cost, annual_volume = annual_volume,
+        life_years = life_years, discount = discount,
+        cost_crc = cost_crc, cost_polyp = cost_polyp, delta_ppc = delta_ppc,
+        cost_co2 = cost_co2, colonoscopy_co2e = colonoscopy_co2e, cade_device_co2e = cade_device_co2e
+      )
+  })
+  
+  best <- res %>% slice_min(c5, n = 1, with_ties = FALSE) %>% mutate(Case = "Best (expanded)")
+  worst <- res %>% slice_max(c5, n = 1, with_ties = FALSE) %>% mutate(Case = "Worst (expanded)")
+  
+  bind_rows(best, worst) %>%
+    transmute(
+      Scenario, Case,
+      Cost_per_CRC_prevented_expanded = c5,
+      Cost_per_CRC_prevented_expanded_fmt = fmt_dollar_na(c5, 1),
+      device_cost, fu_cost, annual_volume, life_years, discount,
+      cost_crc, cost_polyp, delta_ppc,
+      cost_co2, colonoscopy_co2e, cade_device_co2e
+    )
+})
+
+#### 9d) STEPWISE CUMULATIVE MIN–MAX (range widens as components are added) ####
+stepwise_minmax_tbl <- map_dfr(scenarios, function(sc0) {
+  dev_lo <- op_low("device_cost"); dev_hi <- op_high("device_cost")
+  fu_lo  <- op_low("fu_cost");     fu_hi  <- op_high("fu_cost")
+  
+  steps <- list(
+    `1) Device` = tidyr::crossing(
+      device_cost = c(dev_lo, dev_hi)
+    ),
+    `2) + Surveillance` = tidyr::crossing(
+      device_cost = c(dev_lo, dev_hi),
+      fu_cost     = c(fu_lo, fu_hi)
+    ),
+    `3) + CRC` = tidyr::crossing(
+      device_cost = c(dev_lo, dev_hi),
+      fu_cost     = c(fu_lo, fu_hi),
+      cost_crc    = c(cost_crc_range["min"], cost_crc_range["max"])
+    ),
+    `4) + Polyp` = tidyr::crossing(
+      device_cost = c(dev_lo, dev_hi),
+      fu_cost     = c(fu_lo, fu_hi),
+      cost_crc    = c(cost_crc_range["min"], cost_crc_range["max"]),
+      cost_polyp  = c(polyp_cost_range["min"], polyp_cost_range["max"]),
+      delta_ppc   = c(delta_ppc_range["min"],  delta_ppc_range["max"])
+    ),
+    `5) + Environmental` = tidyr::crossing(
+      device_cost = c(dev_lo, dev_hi),
+      fu_cost     = c(fu_lo, fu_hi),
+      cost_crc    = c(cost_crc_range["min"], cost_crc_range["max"]),
+      cost_polyp  = c(polyp_cost_range["min"], polyp_cost_range["max"]),
+      delta_ppc   = c(delta_ppc_range["min"],  delta_ppc_range["max"]),
+      cost_co2    = c(cost_co2_range["min"], cost_co2_range["max"]),
+      colonoscopy_co2e = c(colonoscopy_co2e_range["min"], colonoscopy_co2e_range["max"]),
+      cade_device_co2e = c(cade_device_co2e_range["min"], cade_device_co2e_range["max"])
+    )
+  )
+  
+  imap_dfr(steps, function(g, step_name) {
+    res <- pmap_dfr(g, function(...) {
+      args <- list(...)
+      sc_mod <- sc0
+      if (!is.null(args$device_cost)) sc_mod$device_cost <- args$device_cost
+      if (!is.null(args$fu_cost))     sc_mod$fu_cost     <- args$fu_cost
+      
+      analyse_expanded(
+        sc_mod,
+        cost_crc   = if (!is.null(args$cost_crc))   args$cost_crc   else cost_crc_range["mean"],
+        cost_polyp = if (!is.null(args$cost_polyp)) args$cost_polyp else polyp_cost_range["mean"],
+        delta_ppc  = if (!is.null(args$delta_ppc))  args$delta_ppc  else delta_ppc_range["mean"],
+        cost_co2   = if (!is.null(args$cost_co2))   args$cost_co2   else cost_co2_range["mean"],
+        colonoscopy_co2e = if (!is.null(args$colonoscopy_co2e)) args$colonoscopy_co2e else colonoscopy_co2e_range["mean"],
+        cade_device_co2e = if (!is.null(args$cade_device_co2e)) args$cade_device_co2e else cade_device_co2e_range["mean"]
+      )
+    })
+    tibble(
+      Scenario = sc0$name,
+      Step = step_name,
+      min = min(res$c5, na.rm = TRUE),
+      max = max(res$c5, na.rm = TRUE)
+    )
+  })
+}) %>%
+  mutate(
+    Step = factor(Step, levels = c("1) Device", "2) + Surveillance", "3) + CRC", "4) + Polyp", "5) + Environmental"))
+  
+#### 9e) PLOT STEPWISE MIN–MAX ####
+stepwise_plot <- ggplot(stepwise_minmax_tbl, aes(x = Step)) +
+  geom_linerange(aes(ymin = min, ymax = max)) +
+  facet_wrap(~ Scenario, scales = "free_y") +
+  labs(
+    x = NULL,
+    y = "Cost per CRC prevented (USD)",
+    title = "Cumulative best–worst range under full uncertainty"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+ggsave("stepwise_best_worst_ranges.png", stepwise_plot, width = 10, height = 5, dpi = 300)
+
+#### 10) POLYP OWSA (Supplementary table): vary COSTpol and ΔPPC ####
+supp_polyp_tbl <- map_dfr(seq_len(nrow(baseline_tbl)), function(i) {
+  sc <- baseline_tbl[i, ]
+  df <- sum(1 / (1 + sc$discount)^seq_len(sc$life_years))
+  V  <- sc$annual_volume
+  base_cost <- sc$pv_device + sc$pv_followup
+  
+  ce_for <- function(cost_pol, delta_ppc) {
+    pv_polyp <- cost_pol * delta_ppc * V * df
+    total_cost <- base_cost + pv_polyp
+    list(
+      cost_crc   = safe_divide(total_cost, sc$crc_prevented),
+      cost_death = safe_divide(total_cost, sc$death_prevented)
+    )
+  }
+  
+  cp_vals   <- polyp_cost_range
+  dppc_vals <- delta_ppc_range
+  
+  cp_min  <- ce_for(cp_vals["min"],  dppc_vals["mean"])
+  cp_mean <- ce_for(cp_vals["mean"], dppc_vals["mean"])
+  cp_max  <- ce_for(cp_vals["max"],  dppc_vals["mean"])
+  dppc_min  <- ce_for(cp_vals["mean"], dppc_vals["min"])
+  dppc_mean <- ce_for(cp_vals["mean"], dppc_vals["mean"])
+  dppc_max  <- ce_for(cp_vals["mean"], dppc_vals["max"])
+  
+  tibble(
+    Scenario  = rep(sc$Scenario, 2),
+    Parameter = c("Cost of polyp removal per colonoscopy", "ΔPPC"),
+    Input_Min  = c(cp_vals["min"],   dppc_vals["min"]),
+    Input_Mean = c(cp_vals["mean"],  dppc_vals["mean"]),
+    Input_Max  = c(cp_vals["max"],   dppc_vals["max"]),
+    Cost_per_CRC_Min    = c(cp_min$cost_crc,   dppc_min$cost_crc),
+    Cost_per_CRC_Mean   = c(cp_mean$cost_crc,  dppc_mean$cost_crc),
+    Cost_per_CRC_Max    = c(cp_max$cost_crc,   dppc_max$cost_crc),
+    Cost_per_death_Min  = c(cp_min$cost_death,   dppc_min$cost_death),
+    Cost_per_death_Mean = c(cp_mean$cost_death,  dppc_mean$cost_death),
+    Cost_per_death_Max  = c(cp_max$cost_death,   dppc_max$cost_death)
+  )
+})
+
+supp_polyp_fmt <- supp_polyp_tbl %>%
+  mutate(
+    Input_Min = ifelse(Parameter == "Cost of polyp removal per colonoscopy",
+                       dollar(Input_Min, accuracy = 1),
+                       scales::number(Input_Min, accuracy = 0.01)),
+    Input_Mean = ifelse(Parameter == "Cost of polyp removal per colonoscopy",
+                        dollar(Input_Mean, accuracy = 1),
+                        scales::number(Input_Mean, accuracy = 0.01)),
+    Input_Max = ifelse(Parameter == "Cost of polyp removal per colonoscopy",
+                       dollar(Input_Max, accuracy = 1),
+                       scales::number(Input_Max, accuracy = 0.01)),
+    Cost_per_CRC_Min    = fmt_dollar_na(Cost_per_CRC_Min, accuracy = 1),
+    Cost_per_CRC_Mean   = fmt_dollar_na(Cost_per_CRC_Mean, accuracy = 1),
+    Cost_per_CRC_Max    = fmt_dollar_na(Cost_per_CRC_Max, accuracy = 1),
+    Cost_per_death_Min  = fmt_dollar_na(Cost_per_death_Min, accuracy = 1),
+    Cost_per_death_Mean = fmt_dollar_na(Cost_per_death_Mean, accuracy = 1),
+    Cost_per_death_Max  = fmt_dollar_na(Cost_per_death_Max, accuracy = 1)
+  )
+
+#### 11) ENVIRONMENTAL TABLE ####
+# follow-up counts are "additional follow-ups per 10k" applied to 10,000 procedures
+n_index <- 10000
+followups_screening <- scenarios[[1]]$fu_per10k
+followups_fit       <- scenarios[[2]]$fu_per10k
+
+device_emissions <- device_cf
+device_use_emissions <- n_index * cade_device_co2e_local
+followup_emissions_screening <- followups_screening * followup_cf
+followup_emissions_fit       <- followups_fit       * followup_cf
+
+total_emissions_screening <- device_emissions + device_use_emissions + followup_emissions_screening
+total_emissions_fit       <- device_emissions + device_use_emissions + followup_emissions_fit
+
+total_tonnes_screening <- total_emissions_screening / 1000
+total_tonnes_fit       <- total_emissions_fit / 1000
+
+per_proc_screening <- total_emissions_screening / n_index
+per_proc_fit       <- total_emissions_fit       / n_index
+
+cost_epa_screening <- total_tonnes_screening * carbon_cost_epa
+cost_eu_screening  <- total_tonnes_screening * carbon_cost_eu
+cost_epa_fit       <- total_tonnes_fit * carbon_cost_epa
+cost_eu_fit        <- total_tonnes_fit * carbon_cost_eu
+
+environmental_tbl <- tibble(
+  Metric = c(
+    "Total device emissions (kg CO2e)",
+    "Device use emissions (kg CO2e)",
+    "Extra follow-up colonoscopies (n)",
+    "Follow-up emissions (kg CO2e)",
+    "Total emissions (kg CO2e)",
+    "Total emissions (tonnes CO2e)",
+    "Emissions per procedure (kg CO2e)",
+    "Carbon cost @ $190/tonne (USD)",
+    "Carbon cost @ $68.83/tonne (USD)"
+  ),
+  `Screening colonoscopy` = c(
+    device_emissions,
+    round(device_use_emissions, 0),
+    followups_screening,
+    round(followup_emissions_screening, 0),
+    round(total_emissions_screening, 0),
+    round(total_tonnes_screening, 1),
+    round(per_proc_screening, 1),
+    round(cost_epa_screening, 0),
+    round(cost_eu_screening, 0)
+  ),
+  `FIT-positive colonoscopy` = c(
+    device_emissions,
+    round(device_use_emissions, 0),
+    followups_fit,
+    round(followup_emissions_fit, 0),
+    round(total_emissions_fit, 0),
+    round(total_tonnes_fit, 1),
+    round(per_proc_fit, 1),
+    round(cost_epa_fit, 0),
+    round(cost_eu_fit, 0)
+  )
+)
+
+#### 12) WRITE EXCEL ####
+sheets <- list(
+  README = readme_tbl,
+  Baseline = baseline_tbl,
+  One_way = sens_tbl,
+  FU_guideline = sens_fu_guideline,
+  Multi_way = as.data.frame(multiway_tbl),
+  MWSA_CostOnly_BestWorst_CRC = as.data.frame(mw_costonly_bw_crc),
+  CEA_CRC_cost_ratio = as.data.frame(cea_crc_ratio_tbl),
+  CEA_CRC_cost_ratio_fmt = as.data.frame(cea_crc_ratio_fmt),
+  CEA_CRC_expansions = as.data.frame(cea_crc_expansions_tbl),
+  CEA_CRC_expansions_fmt = as.data.frame(cea_crc_expansions_fmt),
+  CEA_polyp_OWSA = as.data.frame(supp_polyp_tbl),
+  CEA_polyp_OWSA_fmt = as.data.frame(supp_polyp_fmt),
+  Environmental = as.data.frame(environmental_tbl),
+  Expanded_BestWorst = as.data.frame(expanded_bestworst_tbl),
+  Stepwise_MinMax = as.data.frame(stepwise_minmax_tbl)
+)
+
+write_xlsx(sheets, path = "CADe_analysis_final.xlsx")
