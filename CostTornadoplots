@@ -1,0 +1,895 @@
+# ======================================================================
+# File: cade_cea_subset8_CENTERED_DELTA_TORNADO_both_baselines.R
+#
+# Produces centered delta plots where x-axis is +/- from 0 (baseline):
+#   A) DELTA vs single-point baseline_c5 (0 = baseline_c5)
+#   B) DELTA vs MW-mean baseline (0 = MW_mean c5)
+#
+# Tornado style ordering:
+#   - Within each Scenario panel, factors are sorted by impact = max(|delta_low|,|delta_high|)
+#
+# Outputs in owsa_subset8_outputs/:
+#   - TORNADO_DELTA_BASELINE_<METHOD>_<set>.png/pdf
+#   - TORNADO_DELTA_MWMEAN_<METHOD>_<set>.png/pdf
+#   - Combined baseline Endpoint 2x2 assembled figure:
+#       TORNADO_DELTA_BASELINE_ENDPOINT_COMBINED.png/pdf
+#   - Combined baseline Endpoint native ggplot:
+#       TORNADO_DELTA_BASELINE_ENDPOINT_COMBINED_NATIVE.png/pdf
+#   - Combined MW mean Endpoint native ggplot:
+#       TORNADO_DELTA_MWMEAN_ENDPOINT_COMBINED_NATIVE.png/pdf
+#   - Excel: CADe_subset8_centered_delta_tornado_outputs.xlsx
+# ======================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(purrr)
+  library(tidyr)
+  library(tibble)
+  library(stringr)
+  library(scales)
+  library(ggplot2)
+  library(writexl)
+})
+
+options(dplyr.summarise.inform = FALSE)
+try(Sys.setlocale("LC_CTYPE", "en_US.UTF-8"), silent = TRUE)
+
+# -----------------------------
+# SETTINGS
+# -----------------------------
+output_dir <- "owsa_subset8_outputs"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+n_grid <- 11
+
+# Force facet order: Screening left, FIT-positive right
+scenario_order <- c("Screening colonoscopy", "FIT-positive colonoscopy")
+
+# Combined plot order for Endpoint summaries
+combined_plot_order <- c(
+  "all8",
+  "no_polyp_no_emis",
+  "no_crc_no_emis",
+  "no_polyp_no_crc"
+)
+
+# fixed constants
+colonoscopy_co2e_const <- 28.4
+cade_device_co2e_const <- 0.40
+delta_ppc_const <- 0.35
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+safe_divide <- function(num, den) ifelse(is.na(den) | den <= 0, NA_real_, num / den)
+
+normalize_scenario <- function(x) {
+  x %>% as.character() %>% str_squish() %>%
+    str_replace_all("[\u2010\u2011\u2012\u2013\u2014\u2212]", "-")
+}
+
+coerce_for_model <- function(param, x) {
+  x <- suppressWarnings(as.numeric(x))
+  if (param == "life_years") return(pmax(1L, as.integer(round(x))))
+  if (param == "annual_volume") return(pmax(1, round(x)))
+  x
+}
+
+grid_values <- function(param, lo, hi, n = 11) {
+  lo <- suppressWarnings(as.numeric(lo))
+  hi <- suppressWarnings(as.numeric(hi))
+  if (is.na(lo) || is.na(hi)) return(numeric(0))
+  if (identical(lo, hi)) return(coerce_for_model(param, lo))
+  if (param %in% c("life_years", "annual_volume")) {
+    vals <- unique(as.integer(round(seq(lo, hi, length.out = n))))
+    vals <- vals[vals >= 1]
+    return(vals)
+  }
+  seq(lo, hi, length.out = n)
+}
+
+fmt_dollars <- function(x) scales::dollar(x, accuracy = 1)
+
+# reorder-within helper (no extra packages)
+make_within_factor <- function(df, label_col, within_col, order_col, sep = "___") {
+  levs <- df %>%
+    arrange(.data[[within_col]], desc(.data[[order_col]]), .data[[label_col]]) %>%
+    mutate(.key = paste(.data[[label_col]], .data[[within_col]], sep = sep)) %>%
+    pull(.key) %>%
+    unique()
+  
+  df %>%
+    mutate(
+      .key = paste(.data[[label_col]], .data[[within_col]], sep = sep),
+      .key = factor(.key, levels = rev(levs))
+    )
+}
+
+strip_within_suffix <- function(x, sep = "___") sub(paste0(sep, ".*$"), "", x)
+
+# Save 4 ggplots as a 2x2 combined figure using grid
+save_plot_grid_2x2 <- function(plot_list, filename, title = NULL,
+                               width = 20, height = 12, dpi = 300) {
+  draw_page <- function() {
+    grid::grid.newpage()
+    
+    if (is.null(title)) {
+      lay <- grid::grid.layout(2, 2)
+      grid::pushViewport(grid::viewport(layout = lay))
+      pos <- list(c(1, 1), c(1, 2), c(2, 1), c(2, 2))
+    } else {
+      lay <- grid::grid.layout(
+        nrow = 3, ncol = 2,
+        heights = grid::unit.c(
+          grid::unit(0.5, "in"),
+          grid::unit(1, "null"),
+          grid::unit(1, "null")
+        )
+      )
+      grid::pushViewport(grid::viewport(layout = lay))
+      grid::grid.text(
+        title,
+        vp = grid::viewport(layout.pos.row = 1, layout.pos.col = 1:2),
+        gp = grid::gpar(fontface = "bold", cex = 1.15)
+      )
+      pos <- list(c(2, 1), c(2, 2), c(3, 1), c(3, 2))
+    }
+    
+    for (i in seq_along(plot_list)) {
+      print(
+        plot_list[[i]],
+        vp = grid::viewport(
+          layout.pos.row = pos[[i]][1],
+          layout.pos.col = pos[[i]][2]
+        )
+      )
+    }
+    
+    grid::popViewport()
+  }
+  
+  png(file.path(output_dir, filename), width = width, height = height, units = "in", res = dpi)
+  draw_page()
+  dev.off()
+  
+  pdf(file.path(output_dir, sub("\\.png$", ".pdf", filename)), width = width, height = height)
+  draw_page()
+  dev.off()
+}
+
+# -----------------------------
+# CORE SCENARIOS (baseline risks + FU fixed)
+# -----------------------------
+scenarios <- list(
+  list(
+    name = "Screening colonoscopy",
+    device_cost = 37238, annual_volume = 1000, life_years = 10, discount = 0.03,
+    fu_per10k = 835, fu_cost = 950,
+    inc_no = 0.0082, inc_with = 0.0071
+  ),
+  list(
+    name = "FIT-positive colonoscopy",
+    device_cost = 37238, annual_volume = 1000, life_years = 10, discount = 0.03,
+    fu_per10k = 108, fu_cost = 950,
+    inc_no = 0.0582, inc_with = 0.0577
+  )
+)
+
+get_scenario_obj <- function(scn_name) {
+  scn_name <- normalize_scenario(scn_name)
+  idx <- which(vapply(scenarios, function(x) identical(normalize_scenario(x$name), scn_name), logical(1)))
+  if (!length(idx)) stop("Scenario not found: ", scn_name)
+  sc <- scenarios[[idx[1]]]
+  sc$name <- normalize_scenario(sc$name)
+  sc
+}
+
+# -----------------------------
+# BASE ANALYSIS (discounted PV program costs)
+# -----------------------------
+analyse <- function(sc) {
+  life_years <- suppressWarnings(as.integer(round(as.numeric(sc$life_years))))
+  if (is.na(life_years) || life_years < 1L) stop("Invalid life_years")
+  
+  discount <- suppressWarnings(as.numeric(sc$discount))
+  if (is.na(discount) || discount < 0) stop("Invalid discount")
+  
+  annual_volume <- suppressWarnings(as.numeric(sc$annual_volume))
+  if (is.na(annual_volume) || annual_volume <= 0) stop("Invalid annual_volume")
+  
+  fu_per10k <- suppressWarnings(as.numeric(sc$fu_per10k))
+  if (is.na(fu_per10k) || fu_per10k < 0) stop("Invalid fu_per10k")
+  
+  fu_cost <- suppressWarnings(as.numeric(sc$fu_cost))
+  if (is.na(fu_cost) || fu_cost < 0) stop("Invalid fu_cost")
+  
+  device_cost <- suppressWarnings(as.numeric(sc$device_cost))
+  if (is.na(device_cost) || device_cost < 0) stop("Invalid device_cost")
+  
+  inc_no <- suppressWarnings(as.numeric(sc$inc_no))
+  inc_with <- suppressWarnings(as.numeric(sc$inc_with))
+  if (is.na(inc_no) || is.na(inc_with)) stop("Invalid risks")
+  
+  yrs <- seq_len(life_years)
+  tot_cols <- annual_volume * life_years
+  annual_fu <- (fu_per10k / 1e4) * annual_volume
+  
+  pv_device   <- sum((device_cost / life_years) / (1 + discount)^yrs)
+  pv_followup <- sum(annual_fu * fu_cost / (1 + discount)^yrs)
+  
+  arr_inc <- pmax(inc_no - inc_with, 0)
+  crc_prevented <- arr_inc * tot_cols
+  
+  tibble(
+    Scenario = sc$name,
+    pv_device = pv_device,
+    pv_followup = pv_followup,
+    arr_incidence = arr_inc,
+    crc_prevented = crc_prevented
+  )
+}
+
+# -----------------------------
+# EXPANDED ANALYSIS (CRC benefit deducted; emissions split corrected)
+# -----------------------------
+analyse_expanded <- function(sc,
+                             cost_crc,
+                             cost_polyp,
+                             delta_ppc,
+                             cost_co2,
+                             colonoscopy_co2e,
+                             cade_device_co2e) {
+  base <- analyse(sc)
+  
+  discount <- as.numeric(sc$discount)
+  life_years <- as.integer(round(as.numeric(sc$life_years)))
+  df <- sum(1 / (1 + discount)^seq_len(life_years))
+  
+  V <- as.numeric(sc$annual_volume)
+  annual_fu <- (as.numeric(sc$fu_per10k) / 1e4) * V
+  
+  pv_crc_savings <- as.numeric(cost_crc) * base$arr_incidence * V * df
+  pv_polyp       <- as.numeric(cost_polyp) * as.numeric(delta_ppc) * V * df
+  pv_co2 <- as.numeric(cost_co2) * ((V * as.numeric(cade_device_co2e)) + (annual_fu * as.numeric(colonoscopy_co2e))) * df
+  
+  pv_program <- base$pv_device + base$pv_followup
+  pv_total <- pv_program - pv_crc_savings + pv_polyp + pv_co2
+  
+  tibble(Scenario = sc$name, c5 = safe_divide(pv_total, base$crc_prevented))
+}
+
+calc_c5 <- function(sc, args) {
+  analyse_expanded(
+    sc,
+    cost_crc = args$cost_crc,
+    cost_polyp = args$cost_polyp,
+    delta_ppc = args$delta_ppc,
+    cost_co2 = args$cost_co2,
+    colonoscopy_co2e = args$colonoscopy_co2e,
+    cade_device_co2e = args$cade_device_co2e
+  )$c5
+}
+
+# -----------------------------
+# INPUTS (8 parameters)
+# -----------------------------
+inputs <- tribble(
+  ~Scenario, ~Pretty, ~Parameter, ~Input_Baseline, ~Input_Min, ~Input_Max,
+  
+  "FIT-positive colonoscopy", "Follow-up colonoscopy cost ($)", "fu_cost",       950.0,    100.0, 1800.0,
+  "FIT-positive colonoscopy", "Discount rate (%)",              "discount",      3.0,      0.0,    5.0,
+  "FIT-positive colonoscopy", "Device lifespan (years)",        "life_years",     10.0,     5.0,   15.0,
+  "FIT-positive colonoscopy", "Annual colonoscopies per CADe (n)", "annual_volume", 1000.0, 500.0, 1500.0,
+  "FIT-positive colonoscopy", "CADe purchase cost ($)",         "device_cost",   37238.0, 25896.0, 50373.0,
+  "FIT-positive colonoscopy", "CRC care cost ($)",              "cost_crc",      55352.0, 44281.6, 66422.4,
+  "FIT-positive colonoscopy", "Cost per kg CO2e ($)",           "cost_co2",      0.069,    0.003,  0.14,
+  "FIT-positive colonoscopy", "Cost per polyp ($)",             "cost_polyp",    287.0,    182.0,  391.0,
+  
+  "Screening colonoscopy",    "Follow-up colonoscopy cost ($)", "fu_cost",       950.0,    100.0, 1800.0,
+  "Screening colonoscopy",    "Discount rate (%)",              "discount",      3.0,      0.0,    5.0,
+  "Screening colonoscopy",    "Device lifespan (years)",        "life_years",     10.0,     5.0,   15.0,
+  "Screening colonoscopy",    "Annual colonoscopies per CADe (n)", "annual_volume", 1000.0, 500.0, 1500.0,
+  "Screening colonoscopy",    "CADe purchase cost ($)",         "device_cost",   37238.0, 25896.0, 50373.0,
+  "Screening colonoscopy",    "CRC care cost ($)",              "cost_crc",      55352.0, 44281.6, 66422.4,
+  "Screening colonoscopy",    "Cost per kg CO2e ($)",           "cost_co2",      0.069,    0.003,  0.14,
+  "Screening colonoscopy",    "Cost per polyp ($)",             "cost_polyp",    287.0,    182.0,  391.0
+) %>%
+  mutate(
+    Scenario = normalize_scenario(Scenario),
+    Parameter = str_squish(Parameter),
+    Input_Baseline = if_else(Parameter == "discount" & Input_Baseline > 1, Input_Baseline / 100, Input_Baseline),
+    Input_Min      = if_else(Parameter == "discount" & Input_Min > 1, Input_Min / 100, Input_Min),
+    Input_Max      = if_else(Parameter == "discount" & Input_Max > 1, Input_Max / 100, Input_Max)
+  )
+
+param_map <- c(
+  fu_cost       = "fu_cost",
+  discount      = "discount",
+  life_years    = "life_years",
+  annual_volume = "annual_volume",
+  device_cost   = "device_cost",
+  cost_crc      = "cost_crc",
+  cost_co2      = "cost_co2",
+  cost_polyp    = "cost_polyp"
+)
+
+scenario_fields <- c("annual_volume", "device_cost", "life_years", "discount", "fu_cost")
+expanded_args   <- c("cost_crc", "cost_polyp", "delta_ppc", "cost_co2", "colonoscopy_co2e", "cade_device_co2e")
+
+defaults_expanded <- list(
+  cost_crc = 55352,
+  cost_polyp = 287,
+  delta_ppc = delta_ppc_const,
+  cost_co2 = 0.069,
+  colonoscopy_co2e = colonoscopy_co2e_const,
+  cade_device_co2e = cade_device_co2e_const
+)
+
+apply_baselines <- function(sc0, df_scn) {
+  sc <- sc0
+  args <- defaults_expanded
+  for (p in intersect(names(param_map), df_scn$Parameter)) {
+    mapped <- unname(param_map[[p]])
+    v <- df_scn$Input_Baseline[df_scn$Parameter == p][1]
+    if (is.na(v)) next
+    v <- coerce_for_model(mapped, v)
+    if (mapped %in% scenario_fields) sc[[mapped]] <- v
+    if (mapped %in% expanded_args)   args[[mapped]] <- v
+  }
+  list(sc = sc, args = args)
+}
+
+apply_term_exclusions_to_args <- function(args, exclude_params) {
+  if ("cost_crc" %in% exclude_params)   args$cost_crc <- 0
+  if ("cost_polyp" %in% exclude_params) args$cost_polyp <- 0
+  if ("cost_co2" %in% exclude_params)   args$cost_co2 <- 0
+  args
+}
+
+# -----------------------------
+# OWSA runner
+# -----------------------------
+run_owsa <- function(method = c("Endpoint", "Exhaustive"), exclude_params = character(), n_grid = 11) {
+  method <- match.arg(method)
+  
+  map_dfr(unique(inputs$Scenario), function(scn_name) {
+    df_scn <- inputs %>% filter(Scenario == scn_name)
+    sc0 <- get_scenario_obj(scn_name)
+    
+    base_pack <- apply_baselines(sc0, df_scn)
+    base_sc <- base_pack$sc
+    base_args <- apply_term_exclusions_to_args(base_pack$args, exclude_params)
+    
+    baseline_c5 <- calc_c5(base_sc, base_args)
+    
+    df_rows <- df_scn %>% filter(!Parameter %in% exclude_params)
+    
+    map_dfr(seq_len(nrow(df_rows)), function(i) {
+      row <- df_rows[i, ]
+      mapped <- unname(param_map[[row$Parameter]])
+      
+      eval_one <- function(v) {
+        v <- coerce_for_model(mapped, v)
+        sc <- base_sc
+        args <- base_args
+        if (mapped %in% scenario_fields) sc[[mapped]] <- v
+        if (mapped %in% expanded_args)   args[[mapped]] <- v
+        calc_c5(sc, args)
+      }
+      
+      if (method == "Endpoint") {
+        min_c5 <- eval_one(row$Input_Min)
+        max_c5 <- eval_one(row$Input_Max)
+      } else {
+        vals <- grid_values(mapped, row$Input_Min, row$Input_Max, n = n_grid)
+        if (!length(vals)) vals <- c(row$Input_Min, row$Input_Max)
+        c5_vals <- vapply(vals, eval_one, numeric(1))
+        min_c5 <- min(c5_vals, na.rm = TRUE)
+        max_c5 <- max(c5_vals, na.rm = TRUE)
+      }
+      
+      low_abs  <- pmin(min_c5, max_c5, na.rm = TRUE)
+      high_abs <- pmax(min_c5, max_c5, na.rm = TRUE)
+      
+      tibble(
+        Method = method,
+        Scenario = scn_name,
+        Pretty = row$Pretty,
+        Parameter = row$Parameter,
+        baseline_c5 = baseline_c5,
+        min_c5 = min_c5,
+        max_c5 = max_c5,
+        low_abs = low_abs,
+        high_abs = high_abs
+      )
+    })
+  })
+}
+
+# -----------------------------
+# MW mean baseline (cached)
+# -----------------------------
+mw_mean_cache <- new.env(parent = emptyenv())
+
+operational_sens_for_mw <- tibble::tribble(
+  ~field,          ~low,  ~high,
+  "annual_volume",  500,   1500,
+  "life_years",     5,     15,
+  "discount",       0.00,  0.05,
+  "fu_cost",        100,   1800,
+  "device_cost",    25896, 50373
+)
+
+fu_grid_for_mw <- function(scn_name, baseline) {
+  scn_name <- normalize_scenario(scn_name)
+  if (scn_name == "Screening colonoscopy") c(low = 719, baseline = baseline, high = 952)
+  else if (scn_name == "FIT-positive colonoscopy") c(low = 64, baseline = baseline, high = 151)
+  else c(baseline = baseline)
+}
+
+build_oper_values_for_mw <- function(sc) {
+  vals <- list()
+  for (f in operational_sens_for_mw$field) {
+    if (f == "discount") {
+      vals[[f]] <- seq(0, 0.05, by = 0.01)
+    } else {
+      lo <- operational_sens_for_mw$low[operational_sens_for_mw$field == f][1]
+      hi <- operational_sens_for_mw$high[operational_sens_for_mw$field == f][1]
+      vals[[f]] <- c(low = lo, baseline = sc[[f]], high = hi)
+    }
+  }
+  vals
+}
+
+compute_mw_mean_c5 <- function(scn_name, exclude_params) {
+  scn_name <- normalize_scenario(scn_name)
+  key <- paste0(scn_name, "||", paste(sort(exclude_params), collapse = ","))
+  if (exists(key, envir = mw_mean_cache, inherits = FALSE)) {
+    return(get(key, envir = mw_mean_cache, inherits = FALSE))
+  }
+  
+  sc0 <- get_scenario_obj(scn_name)
+  df_scn <- inputs %>% filter(Scenario == scn_name)
+  base_pack <- apply_baselines(sc0, df_scn)
+  sc_base <- base_pack$sc
+  args_base <- apply_term_exclusions_to_args(base_pack$args, exclude_params)
+  
+  oper_values <- build_oper_values_for_mw(sc_base)
+  fu_values <- fu_grid_for_mw(sc_base$name, sc_base$fu_per10k)
+  
+  grid <- tidyr::crossing(
+    device_cost   = oper_values$device_cost,
+    fu_cost       = oper_values$fu_cost,
+    annual_volume = oper_values$annual_volume,
+    life_years    = oper_values$life_years,
+    discount      = oper_values$discount,
+    fu_per10k     = fu_values
+  )
+  
+  c5_vals <- purrr::pmap_dbl(
+    grid,
+    function(device_cost, fu_cost, annual_volume, life_years, discount, fu_per10k) {
+      sc <- sc_base
+      sc$device_cost <- device_cost
+      sc$fu_cost <- fu_cost
+      sc$annual_volume <- annual_volume
+      sc$life_years <- as.integer(life_years)
+      sc$discount <- discount
+      sc$fu_per10k <- fu_per10k
+      calc_c5(sc, args_base)
+    }
+  )
+  
+  val <- mean(c5_vals, na.rm = TRUE)
+  assign(key, val, envir = mw_mean_cache)
+  val
+}
+
+# -----------------------------
+# Single tornado plot (baseline or MW mean)
+# -----------------------------
+make_centered_delta_tornado <- function(df_tbl, exclude_params,
+                                        baseline_type = c("baseline_c5", "mw_mean"),
+                                        title, filename) {
+  baseline_type <- match.arg(baseline_type)
+  
+  if (baseline_type == "baseline_c5") {
+    base_tbl <- df_tbl %>%
+      distinct(Scenario, base = baseline_c5) %>%
+      mutate(base_label = paste0("0 = Baseline (", fmt_dollars(base), ")"))
+    
+    x_lab <- "Change from baseline (USD per CRC prevented)\n(Negative = cheaper than baseline; positive = more expensive)"
+  } else {
+    base_tbl <- df_tbl %>%
+      distinct(Scenario) %>%
+      mutate(
+        base = map_dbl(Scenario, ~ compute_mw_mean_c5(.x, exclude_params)),
+        base_label = paste0("0 = MW mean (", fmt_dollars(base), ")")
+      )
+    
+    x_lab <- "Change from MW mean (USD per CRC prevented)\n(Negative = cheaper than MW mean; positive = more expensive)"
+  }
+  
+  df2 <- df_tbl %>%
+    left_join(base_tbl, by = "Scenario") %>%
+    mutate(
+      Scenario = factor(Scenario, levels = scenario_order),
+      delta_low  = low_abs  - base,
+      delta_high = high_abs - base,
+      impact = pmax(abs(delta_low), abs(delta_high), na.rm = TRUE)
+    )
+  
+  df2 <- make_within_factor(df2, label_col = "Pretty", within_col = "Scenario", order_col = "impact")
+  
+  baseline_rows <- base_tbl %>%
+    mutate(Scenario = factor(Scenario, levels = scenario_order)) %>%
+    transmute(
+      Method = NA_character_,
+      Scenario = Scenario,
+      Pretty = "BASELINE VALUE ($)",
+      Parameter = NA_character_,
+      baseline_c5 = base,
+      min_c5 = NA_real_,
+      max_c5 = NA_real_,
+      low_abs = NA_real_,
+      high_abs = NA_real_,
+      base = base,
+      base_label = base_label,
+      delta_low = NA_real_,
+      delta_high = NA_real_,
+      impact = Inf
+    )
+  
+  df2 <- bind_rows(df2, baseline_rows)
+  df2 <- make_within_factor(df2, label_col = "Pretty", within_col = "Scenario", order_col = "impact")
+  
+  p <- ggplot(df2, aes(y = .key)) +
+    geom_linerange(
+      data = df2 %>% filter(Pretty != "BASELINE VALUE ($)"),
+      aes(xmin = pmin(delta_low, delta_high), xmax = pmax(delta_low, delta_high)),
+      linewidth = 1.1
+    ) +
+    facet_wrap(~ Scenario, ncol = 2, scales = "free_y", drop = FALSE) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1.0) +
+    geom_text(
+      data = df2 %>% filter(Pretty == "BASELINE VALUE ($)"),
+      aes(x = 0, y = .key, label = base_label),
+      inherit.aes = FALSE,
+      hjust = -0.05,
+      vjust = 0.5,
+      size = 3
+    ) +
+    coord_cartesian(clip = "off") +
+    scale_y_discrete(labels = function(x) strip_within_suffix(x)) +
+    scale_x_continuous(labels = scales::label_number(big.mark = ",", accuracy = 1)) +
+    labs(
+      title = title,
+      x = x_lab,
+      y = NULL
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(t = 12, r = 40, b = 12, l = 12, unit = "pt")
+    )
+  
+  ggsave(file.path(output_dir, filename), p, width = 12.5, height = 6.0, dpi = 300)
+  ggsave(file.path(output_dir, sub("\\.png$", ".pdf", filename)), p, width = 12.5, height = 6.0)
+  p
+}
+
+# -----------------------------
+# Combined baseline Endpoint native ggplot
+# -----------------------------
+make_combined_endpoint_baseline_ggplot <- function(exclusion_specs,
+                                                   plot_order,
+                                                   title = "Tornado (Δ vs baseline), Endpoint",
+                                                   filename = "TORNADO_DELTA_BASELINE_ENDPOINT_COMBINED_NATIVE.png") {
+  panel_levels <- unlist(lapply(plot_order, function(set_name) {
+    spec <- exclusion_specs[[set_name]]
+    paste0(spec$title, "\n", scenario_order)
+  }))
+  
+  df_plot <- map_dfr(plot_order, function(set_name) {
+    spec <- exclusion_specs[[set_name]]
+    excl <- spec$exclude_params
+    
+    df_tbl <- run_owsa(method = "Endpoint", exclude_params = excl, n_grid = n_grid)
+    
+    base_tbl <- df_tbl %>%
+      distinct(Scenario, base = baseline_c5) %>%
+      mutate(
+        Set_Name = set_name,
+        Set_Title = spec$title,
+        Scenario = factor(Scenario, levels = scenario_order),
+        Panel = factor(
+          paste0(Set_Title, "\n", as.character(Scenario)),
+          levels = panel_levels
+        ),
+        base_label = paste0("0 = Baseline (", fmt_dollars(base), ")")
+      )
+    
+    df2 <- df_tbl %>%
+      mutate(
+        Set_Name = set_name,
+        Set_Title = spec$title,
+        Scenario = factor(Scenario, levels = scenario_order)
+      ) %>%
+      left_join(
+        base_tbl %>% select(Set_Name, Scenario, base, base_label, Panel),
+        by = c("Set_Name", "Scenario")
+      ) %>%
+      mutate(
+        delta_low  = low_abs  - base,
+        delta_high = high_abs - base,
+        impact = pmax(abs(delta_low), abs(delta_high), na.rm = TRUE)
+      )
+    
+    baseline_rows <- base_tbl %>%
+      transmute(
+        Method = NA_character_,
+        Scenario = Scenario,
+        Pretty = "BASELINE VALUE ($)",
+        Parameter = NA_character_,
+        baseline_c5 = base,
+        min_c5 = NA_real_,
+        max_c5 = NA_real_,
+        low_abs = NA_real_,
+        high_abs = NA_real_,
+        Set_Name = Set_Name,
+        Set_Title = Set_Title,
+        base = base,
+        base_label = base_label,
+        Panel = Panel,
+        delta_low = NA_real_,
+        delta_high = NA_real_,
+        impact = Inf
+      )
+    
+    bind_rows(df2, baseline_rows)
+  })
+  
+  df_plot <- make_within_factor(
+    df_plot,
+    label_col = "Pretty",
+    within_col = "Panel",
+    order_col = "impact"
+  )
+  
+  p <- ggplot(df_plot, aes(y = .key)) +
+    geom_linerange(
+      data = df_plot %>% filter(Pretty != "BASELINE VALUE ($)"),
+      aes(xmin = pmin(delta_low, delta_high), xmax = pmax(delta_low, delta_high)),
+      linewidth = 1.1
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1.0) +
+    geom_text(
+      data = df_plot %>% filter(Pretty == "BASELINE VALUE ($)"),
+      aes(x = 0, y = .key, label = base_label),
+      inherit.aes = FALSE,
+      hjust = -0.05,
+      vjust = 0.5,
+      size = 2.8
+    ) +
+    facet_wrap(~ Panel, ncol = 2, scales = "free_y", drop = FALSE) +
+    coord_cartesian(clip = "off") +
+    scale_y_discrete(labels = function(x) strip_within_suffix(x)) +
+    scale_x_continuous(labels = scales::label_number(big.mark = ",", accuracy = 1)) +
+    labs(
+      title = title,
+      x = "Change from baseline (USD per CRC prevented)\n(Negative = cheaper than baseline; positive = more expensive)",
+      y = NULL
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(t = 12, r = 40, b = 12, l = 12, unit = "pt"),
+      strip.text = element_text(size = 9)
+    )
+  
+  ggsave(file.path(output_dir, filename), p, width = 14, height = 18, dpi = 300)
+  ggsave(file.path(output_dir, sub("\\.png$", ".pdf", filename)), p, width = 14, height = 18)
+  
+  p
+}
+
+# -----------------------------
+# Combined MW mean Endpoint native ggplot
+# -----------------------------
+make_combined_endpoint_mwmean_ggplot <- function(exclusion_specs,
+                                                 plot_order,
+                                                 title = "Tornado (Δ vs MW mean), Endpoint",
+                                                 filename = "TORNADO_DELTA_MWMEAN_ENDPOINT_COMBINED_NATIVE.png") {
+  panel_levels <- unlist(lapply(plot_order, function(set_name) {
+    spec <- exclusion_specs[[set_name]]
+    paste0(spec$title, "\n", scenario_order)
+  }))
+  
+  df_plot <- map_dfr(plot_order, function(set_name) {
+    spec <- exclusion_specs[[set_name]]
+    excl <- spec$exclude_params
+    
+    df_tbl <- run_owsa(method = "Endpoint", exclude_params = excl, n_grid = n_grid)
+    
+    base_tbl <- df_tbl %>%
+      distinct(Scenario) %>%
+      mutate(
+        Set_Name = set_name,
+        Set_Title = spec$title,
+        Scenario = factor(Scenario, levels = scenario_order),
+        base = map_dbl(as.character(Scenario), ~ compute_mw_mean_c5(.x, excl)),
+        Panel = factor(
+          paste0(Set_Title, "\n", as.character(Scenario)),
+          levels = panel_levels
+        ),
+        base_label = paste0("0 = MW mean (", fmt_dollars(base), ")")
+      )
+    
+    df2 <- df_tbl %>%
+      mutate(
+        Set_Name = set_name,
+        Set_Title = spec$title,
+        Scenario = factor(Scenario, levels = scenario_order)
+      ) %>%
+      left_join(
+        base_tbl %>% select(Set_Name, Scenario, base, base_label, Panel),
+        by = c("Set_Name", "Scenario")
+      ) %>%
+      mutate(
+        delta_low  = low_abs  - base,
+        delta_high = high_abs - base,
+        impact = pmax(abs(delta_low), abs(delta_high), na.rm = TRUE)
+      )
+    
+    baseline_rows <- base_tbl %>%
+      transmute(
+        Method = NA_character_,
+        Scenario = Scenario,
+        Pretty = "BASELINE VALUE ($)",
+        Parameter = NA_character_,
+        baseline_c5 = NA_real_,
+        min_c5 = NA_real_,
+        max_c5 = NA_real_,
+        low_abs = NA_real_,
+        high_abs = NA_real_,
+        Set_Name = Set_Name,
+        Set_Title = Set_Title,
+        base = base,
+        base_label = base_label,
+        Panel = Panel,
+        delta_low = NA_real_,
+        delta_high = NA_real_,
+        impact = Inf
+      )
+    
+    bind_rows(df2, baseline_rows)
+  })
+  
+  df_plot <- make_within_factor(
+    df_plot,
+    label_col = "Pretty",
+    within_col = "Panel",
+    order_col = "impact"
+  )
+  
+  p <- ggplot(df_plot, aes(y = .key)) +
+    geom_linerange(
+      data = df_plot %>% filter(Pretty != "BASELINE VALUE ($)"),
+      aes(xmin = pmin(delta_low, delta_high), xmax = pmax(delta_low, delta_high)),
+      linewidth = 1.1
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1.0) +
+    geom_text(
+      data = df_plot %>% filter(Pretty == "BASELINE VALUE ($)"),
+      aes(x = 0, y = .key, label = base_label),
+      inherit.aes = FALSE,
+      hjust = -0.05,
+      vjust = 0.5,
+      size = 2.8
+    ) +
+    facet_wrap(~ Panel, ncol = 2, scales = "free_y", drop = FALSE) +
+    coord_cartesian(clip = "off") +
+    scale_y_discrete(labels = function(x) strip_within_suffix(x)) +
+    scale_x_continuous(labels = scales::label_number(big.mark = ",", accuracy = 1)) +
+    labs(
+      title = title,
+      x = "Change from MW mean (USD per CRC prevented)\n(Negative = cheaper than MW mean; positive = more expensive)",
+      y = NULL
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(t = 12, r = 40, b = 12, l = 12, unit = "pt"),
+      strip.text = element_text(size = 9)
+    )
+  
+  ggsave(file.path(output_dir, filename), p, width = 14, height = 18, dpi = 300)
+  ggsave(file.path(output_dir, sub("\\.png$", ".pdf", filename)), p, width = 14, height = 18)
+  
+  p
+}
+
+# -----------------------------
+# Exclusion sets
+# -----------------------------
+exclusion_specs <- list(
+  all8 = list(
+    title = "All factors",
+    exclude_params = character()
+  ),
+  no_polyp_no_crc = list(
+    title = "Main factors + emission cost",
+    exclude_params = c("cost_polyp", "cost_crc")
+  ),
+  no_polyp_no_emis = list(
+    title = "Main factors + cost CRC",
+    exclude_params = c("cost_polyp", "cost_co2")
+  ),
+  no_crc_no_emis = list(
+    title = "Main factors + polypectomy cost",
+    exclude_params = c("cost_crc", "cost_co2")
+  ),
+  no_polyp_no_crc_no_emis = list(
+    title = "Main factors",
+    exclude_params = c("cost_polyp", "cost_crc", "cost_co2")
+  )
+)
+
+# -----------------------------
+# RUN ALL
+# -----------------------------
+excel_tabs <- list(Inputs_used = inputs)
+baseline_endpoint_plots <- list()
+
+for (set_name in names(exclusion_specs)) {
+  spec <- exclusion_specs[[set_name]]
+  excl <- spec$exclude_params
+  
+  for (m in c("Endpoint", "Exhaustive")) {
+    df_tbl <- run_owsa(m, excl, n_grid)
+    excel_tabs[[paste0("OWSA_", m, "_", set_name)]] <- df_tbl
+    
+    p_baseline <- make_centered_delta_tornado(
+      df_tbl = df_tbl,
+      exclude_params = excl,
+      baseline_type = "baseline_c5",
+      title = paste0("Tornado (Δ vs baseline), ", m, ", ", spec$title),
+      filename = paste0("TORNADO_DELTA_BASELINE_", toupper(m), "_", set_name, ".png")
+    )
+    
+    if (m == "Endpoint" && set_name %in% combined_plot_order) {
+      baseline_endpoint_plots[[set_name]] <- p_baseline + labs(title = spec$title)
+    }
+    
+    make_centered_delta_tornado(
+      df_tbl = df_tbl,
+      exclude_params = excl,
+      baseline_type = "mw_mean",
+      title = paste0("Tornado (Δ vs MW mean), ", m, ", ", spec$title),
+      filename = paste0("TORNADO_DELTA_MWMEAN_", toupper(m), "_", set_name, ".png")
+    )
+  }
+}
+
+# Combined baseline Endpoint 2x2 assembled figure
+save_plot_grid_2x2(
+  plot_list = baseline_endpoint_plots[combined_plot_order],
+  filename = "TORNADO_DELTA_BASELINE_ENDPOINT_COMBINED.png",
+  title = "Tornado (Δ vs baseline), Endpoint"
+)
+
+# Combined baseline Endpoint native ggplot
+p_combined_baseline_native <- make_combined_endpoint_baseline_ggplot(
+  exclusion_specs = exclusion_specs,
+  plot_order = combined_plot_order,
+  title = "Tornado (Δ vs baseline), Endpoint"
+)
+
+# Combined MW mean Endpoint native ggplot
+p_combined_mwmean_native <- make_combined_endpoint_mwmean_ggplot(
+  exclusion_specs = exclusion_specs,
+  plot_order = combined_plot_order,
+  title = "Tornado (Δ vs MW mean), Endpoint"
+)
+
+write_xlsx(excel_tabs, path = file.path(output_dir, "CADe_subset8_centered_delta_tornado_outputs.xlsx"))
+message("Done. Tornado-style centered delta plots + Excel saved in: ", normalizePath(output_dir))
