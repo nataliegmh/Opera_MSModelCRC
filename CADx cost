@@ -1,0 +1,614 @@
+#### RUN_OD_CADX_OVERLAY_FIXED.R
+#### One-go runner: sources CEA_030326.R then computes OD overlays (RAD_NORMAL, DISCARD_LITE, LIS)
+#### by provider (ENDO vs CADX) and country; includes main and extended costs; safe Excel export.
+#### Adds a simple output table with:
+#### - CADe-only cost per CRC prevented
+#### - CADe + CADx cost per CRC prevented
+#### - Incremental CADx cost per CRC prevented (CADe+CADx minus CADe-only)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(purrr)
+  library(tidyr)
+  library(tibble)
+  library(writexl)
+  library(scales)
+})
+
+options(dplyr.summarise.inform = FALSE)
+
+# -----------------------------
+# 0) SAFE XLSX WRITER
+# -----------------------------
+safe_write_xlsx <- function(sheets, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  tryCatch({
+    writexl::write_xlsx(sheets, path)
+    message("Wrote: ", normalizePath(path, winslash = "/", mustWork = FALSE))
+  }, error = function(e) {
+    alt <- sub("\\.xlsx$", paste0("_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".xlsx"), path)
+    message("Primary write failed: ", conditionMessage(e))
+    message("Trying: ", normalizePath(alt, winslash = "/", mustWork = FALSE))
+    writexl::write_xlsx(sheets, alt)
+    message("Wrote: ", normalizePath(alt, winslash = "/", mustWork = FALSE))
+  })
+}
+
+# -----------------------------
+# 1) HELPERS
+# -----------------------------
+safe_divide <- function(num, den) {
+  ifelse(is.na(den) | den == 0, NA_real_, num / den)
+}
+
+pv_factor <- function(years, discount) {
+  sum(1 / (1 + discount)^(seq_len(years)))
+}
+
+pick_col <- function(df, candidates) {
+  hit <- intersect(candidates, names(df))
+  if (length(hit) == 0) NA_character_ else hit[[1]]
+}
+
+norm_country <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- gsub("[^A-Z]", "", x)
+  dplyr::case_when(
+    x %in% c("US", "USA", "UNITEDSTATES") ~ "US",
+    x %in% c("UK", "UNITEDKINGDOM", "GB", "GREATBRITAIN", "ENGLAND") ~ "UK",
+    x %in% c("JAPAN", "JP") ~ "JAPAN",
+    x %in% c("NORWAY", "NO") ~ "NORWAY",
+    TRUE ~ x
+  )
+}
+
+norm_provider <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- gsub("[^A-Z]", "", x)
+  dplyr::case_when(
+    x %in% c("ENDO", "ENDOSCOPIST", "ENDOSCOPISTALONE", "PHYSICIAN") ~ "ENDO",
+    x %in% c("CADX", "CAD", "AI", "AID", "CADXASSISTED") ~ "CADX",
+    TRUE ~ x
+  )
+}
+
+norm_strategy <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- gsub("[^A-Z_]", "", x)
+  dplyr::case_when(
+    x %in% c("RAD", "RADNORMAL", "RAD_NORMAL") ~ "RAD_NORMAL",
+    x %in% c("DISCARD", "DISCARDLITE", "DISCARD_LITE") ~ "DISCARD_LITE",
+    x %in% c("LIS", "LEAVEINSITU", "LEAVE_IN_SITU") ~ "LIS",
+    x %in% c("TOTALREMOVAL", "TOTAL_REMOVAL", "REFERENCE", "REF") ~ "TOTAL_REMOVAL",
+    TRUE ~ x
+  )
+}
+
+# surveillance mapping:
+# shorter interval => +1 follow-up within 10 years
+# longer interval  => -1 follow-up within 10 years
+delta_fu_per_patient_10y <- function(p_shorter, p_longer, m_shorter = 1, m_longer = 1) {
+  p_shorter * m_shorter - p_longer * m_longer
+}
+
+# CADx device price is article-based.
+# Device life is adapted here to 10 years.
+pv_cadx_device_cost <- function(discount,
+                                scenario_years,
+                                cadx_device_capex_usd,
+                                cadx_device_life_years = 10) {
+  yrs <- seq_len(min(scenario_years, cadx_device_life_years))
+  sum((cadx_device_capex_usd / cadx_device_life_years) / (1 + discount)^yrs)
+}
+
+fmt_num <- function(x, accuracy = 0.01) {
+  ifelse(is.na(x), "N/A", scales::number(x, accuracy = accuracy, big.mark = ","))
+}
+
+fmt_dollar_na <- function(x, accuracy = 1) {
+  ifelse(is.na(x), "N/A", scales::dollar(x, accuracy = accuracy))
+}
+
+# -----------------------------
+# 2) SOURCE YOUR FULL CADe MODEL
+# -----------------------------
+if (!file.exists("CEA_030326.R")) stop("Could not find 'CEA_030326.R' in the working directory.")
+source("CEA_030326.R")
+
+if (!exists("baseline_tbl")) stop("Object 'baseline_tbl' not found after sourcing CEA_030326.R.")
+if (!is.data.frame(baseline_tbl)) stop("'baseline_tbl' exists but is not a data.frame/tibble.")
+
+# Flexible mapping to baseline_tbl columns
+col_scenario   <- pick_col(baseline_tbl, c("Scenario", "scenario"))
+col_annual_vol <- pick_col(baseline_tbl, c("annual_volume", "AnnualVolume", "volume"))
+col_years      <- pick_col(baseline_tbl, c("life_years", "LifeYears", "years"))
+col_discount   <- pick_col(baseline_tbl, c("discount", "DiscountRate"))
+col_fu_cost    <- pick_col(baseline_tbl, c("fu_cost", "FU_cost", "followup_cost"))
+col_fu_per10k  <- pick_col(baseline_tbl, c("fu_per10k", "FU_per10k", "fu_per_10k"))
+col_pv_device  <- pick_col(baseline_tbl, c("pv_device", "pv_device_cost"))
+col_pv_fu      <- pick_col(baseline_tbl, c("pv_followup", "pv_fu", "pv_follow_up"))
+col_arr_inc    <- pick_col(baseline_tbl, c("arr_incidence", "arr_inc", "arr_crc"))
+col_arr_death  <- pick_col(baseline_tbl, c("arr_death", "arr_mortality"))
+
+needed <- c(
+  col_scenario, col_annual_vol, col_years, col_discount, col_fu_cost, col_fu_per10k,
+  col_pv_device, col_pv_fu, col_arr_inc, col_arr_death
+)
+
+if (any(is.na(needed))) {
+  stop(
+    "baseline_tbl missing required columns.\nFound: ", paste(names(baseline_tbl), collapse = ", "),
+    "\nNeed at least Scenario, annual_volume, life_years, discount, fu_cost, fu_per10k, pv_device, pv_followup, arr_incidence, arr_death."
+  )
+}
+
+# -----------------------------
+# 3) INPUTS YOU CONTROL
+# -----------------------------
+countries <- c("US", "UK", "JAPAN", "NORWAY")
+
+# CADx device price ($48,814) is taken from the published study.
+# Device life is adapted here to 10 years.
+# Confidence is not directly parameterised for LIS and DISCARD_LITE in this script.
+# Any confidence effect is implicit through the observed OD resource-use and surveillance inputs.
+cadx_device_capex_usd <- 48814
+cadx_device_life_years <- 10
+
+# CO2e factors (kg CO2e/item)
+co2e_per_snare     <- 0.41
+co2e_per_trap      <- 0.37
+co2e_per_jar       <- 0.29
+co2e_cadx_per_proc <- 0.311
+
+# Carbon cost $/kg CO2e
+carbon_cost_per_kg <- 0.10
+
+# Unit costs
+unit_costs <- tribble(
+  ~country, ~snare_cost, ~trap_cost, ~jar_cost,
+  "US",     35,          25,         65,
+  "UK",     25,          18,         45,
+  "JAPAN",  30,          20,         50,
+  "NORWAY", 28,          20,         55
+) %>%
+  mutate(country = norm_country(country))
+
+# OD resource-use rates (per procedure) for LIS and DISCARD-lite.
+# Article-aligned downstream operational consequences.
+od_resource_rates <- tribble(
+  ~od_strategy,     ~provider, ~jars_per_proc, ~polypectomy_rate,
+  "TOTAL_REMOVAL",  "REF",     1.51,           0.58,
+  "LIS",            "CADX",    1.12,           0.48,
+  "LIS",            "ENDO",    1.18,           0.50,
+  "DISCARD_LITE",   "CADX",    0.37,           0.48,
+  "DISCARD_LITE",   "ENDO",    0.52,           0.50
+) %>%
+  mutate(
+    od_strategy = norm_strategy(od_strategy),
+    provider = norm_provider(provider)
+  )
+
+# RAD-normal parameters.
+# RAD_NORMAL remains a modelling construct here.
+# It includes confidence explicitly through p_high_conf.
+rad_params <- list(
+  diminutive_polyps_per_proc = 1.51,
+  p_high_conf = 0.894,
+  polypectomy_rate = 0.58,
+  jars_baseline_total_removal = 1.51
+)
+
+# -----------------------------
+# 4) SURVEILLANCE EFFECTS (Supplement Table 8s, N=1,134)
+# Table 8s surveillance reclassification is interpreted as a 10-year effect.
+# We annualise it over 10 years and apply it only over the first 10 years of the model horizon.
+# LIS and DISCARD_LITE are article-derived.
+# RAD_NORMAL is an assumption here: it uses the same shorter/longer surveillance effects as DISCARD_LITE.
+# -----------------------------
+N <- 1134
+
+surv_table8 <- tribble(
+  ~country, ~od_strategy,      ~provider, ~p_shorter, ~p_longer,
+
+  "US",     "LIS",             "CADX",    4/N,        7/N,
+  "US",     "LIS",             "ENDO",    3/N,        6/N,
+  "UK",     "LIS",             "CADX",    0/N,        2/N,
+  "UK",     "LIS",             "ENDO",    0/N,        2/N,
+  "JAPAN",  "LIS",             "CADX",    22/N,       10/N,
+  "JAPAN",  "LIS",             "ENDO",    17/N,       8/N,
+  "NORWAY", "LIS",             "CADX",    0/N,        1/N,
+  "NORWAY", "LIS",             "ENDO",    0/N,        1/N,
+
+  "US",     "DISCARD_LITE",    "CADX",    55/N,       9/N,
+  "US",     "DISCARD_LITE",    "ENDO",    49/N,       9/N,
+  "UK",     "DISCARD_LITE",    "CADX",    5/N,        1/N,
+  "UK",     "DISCARD_LITE",    "ENDO",    5/N,        2/N,
+  "JAPAN",  "DISCARD_LITE",    "CADX",    47/N,       10/N,
+  "JAPAN",  "DISCARD_LITE",    "ENDO",    39/N,       9/N,
+  "NORWAY", "DISCARD_LITE",    "CADX",    7/N,        1/N,
+  "NORWAY", "DISCARD_LITE",    "ENDO",    6/N,        1/N
+) %>%
+  mutate(
+    country = norm_country(country),
+    od_strategy = norm_strategy(od_strategy),
+    provider = norm_provider(provider)
+  )
+
+# RAD_NORMAL copied from DISCARD_LITE as a modelling assumption
+surv_rad_normal <- surv_table8 %>%
+  filter(od_strategy == "DISCARD_LITE") %>%
+  mutate(od_strategy = "RAD_NORMAL")
+
+surv_all <- bind_rows(surv_table8, surv_rad_normal)
+
+# -----------------------------
+# 5) OD ARMS
+# -----------------------------
+od_arms <- tribble(
+  ~od_strategy,    ~provider, ~uses_cadx,
+  "RAD_NORMAL",    "ENDO",    FALSE,
+  "RAD_NORMAL",    "CADX",    TRUE,
+  "LIS",           "ENDO",    FALSE,
+  "LIS",           "CADX",    TRUE,
+  "DISCARD_LITE",  "ENDO",    FALSE,
+  "DISCARD_LITE",  "CADX",    TRUE
+) %>%
+  mutate(
+    od_strategy = norm_strategy(od_strategy),
+    provider = norm_provider(provider)
+  )
+
+# -----------------------------
+# 6) CORE COSTING FUNCTION
+# -----------------------------
+calc_od_costs <- function(base_row, country, od_strategy, provider, uses_cadx) {
+  country <- norm_country(country)
+  od_strategy <- norm_strategy(od_strategy)
+  provider <- norm_provider(provider)
+
+  annual_volume <- base_row[[col_annual_vol]]
+  years         <- base_row[[col_years]]
+  discount      <- base_row[[col_discount]]
+  fu_cost       <- base_row[[col_fu_cost]]
+  fu_per10k0    <- base_row[[col_fu_per10k]]
+  pv_device0    <- base_row[[col_pv_device]]
+  arr_inc       <- base_row[[col_arr_inc]]
+  arr_death     <- base_row[[col_arr_death]]
+
+  df_pv <- pv_factor(years, discount)
+
+  surv <- surv_all %>%
+    filter(
+      .data$country == country,
+      .data$od_strategy == od_strategy,
+      .data$provider == provider
+    )
+
+  if (nrow(surv) != 1 && od_strategy == "RAD_NORMAL") {
+    surv <- surv_all %>%
+      filter(
+        .data$country == country,
+        .data$od_strategy == "DISCARD_LITE",
+        .data$provider == provider
+      )
+  }
+
+  if (nrow(surv) != 1) {
+    stop("Surveillance lookup failure for ", country, " / ", od_strategy, " / ", provider)
+  }
+
+  # 10-year surveillance effect
+  d_fu_patient_10y <- delta_fu_per_patient_10y(
+    surv$p_shorter, surv$p_longer,
+    m_shorter = 1, m_longer = 1
+  )
+  d_fu_per10k_per_year <- (d_fu_patient_10y / 10) * 10000
+
+  # apply changed surveillance only over first 10 years
+  n_fu_years_changed <- min(years, 10L)
+
+  annual_fu_base <- (fu_per10k0 / 1e4) * annual_volume
+  annual_fu_od_changed <- ((fu_per10k0 + d_fu_per10k_per_year) / 1e4) * annual_volume
+
+  pv_fu_od <-
+    sum(annual_fu_od_changed * fu_cost / (1 + discount)^(seq_len(n_fu_years_changed))) +
+    if (years > n_fu_years_changed) {
+      sum(annual_fu_base * fu_cost / (1 + discount)^(seq.int(n_fu_years_changed + 1L, years)))
+    } else {
+      0
+    }
+
+  fu_per10k_od <- fu_per10k0 + d_fu_per10k_per_year
+
+  pv_cadx_capex <- if (isTRUE(uses_cadx)) {
+    pv_cadx_device_cost(
+      discount = discount,
+      scenario_years = years,
+      cadx_device_capex_usd = cadx_device_capex_usd,
+      cadx_device_life_years = cadx_device_life_years
+    )
+  } else {
+    0
+  }
+
+  pv_device_od <- pv_device0 + pv_cadx_capex
+  cost_main_pv <- pv_device_od + pv_fu_od
+
+  u <- unit_costs %>% filter(.data$country == country)
+  if (nrow(u) != 1) stop("Missing unit_costs for country: ", country)
+
+  if (od_strategy %in% c("LIS", "DISCARD_LITE")) {
+    rr <- od_resource_rates %>% filter(.data$od_strategy == od_strategy, .data$provider == provider)
+    if (nrow(rr) != 1) stop("Missing od_resource_rates for ", od_strategy, " / ", provider)
+    jars_per_proc <- rr$jars_per_proc[[1]]
+    polyp_rate    <- rr$polypectomy_rate[[1]]
+  } else if (od_strategy == "RAD_NORMAL") {
+    polyp_rate <- rad_params$polypectomy_rate
+    saved_jars <- rad_params$p_high_conf * rad_params$diminutive_polyps_per_proc
+    jars_per_proc <- max(rad_params$jars_baseline_total_removal - saved_jars, 0)
+  } else {
+    stop("Unknown od_strategy: ", od_strategy)
+  }
+
+  annual_procs <- annual_volume
+  annual_polypectomies <- polyp_rate * annual_procs
+
+  annual_snares <- annual_polypectomies
+  annual_traps  <- annual_polypectomies
+  annual_jars   <- jars_per_proc * annual_procs
+
+  annual_polyp_mgmt_cost <-
+    annual_snares * u$snare_cost +
+    annual_traps * u$trap_cost +
+    annual_jars * u$jar_cost
+
+  pv_polyp_mgmt_cost <- annual_polyp_mgmt_cost * df_pv
+
+  annual_co2_items <-
+    annual_snares * co2e_per_snare +
+    annual_traps * co2e_per_trap +
+    annual_jars * co2e_per_jar
+
+  annual_co2_cadx  <- if (isTRUE(uses_cadx)) annual_procs * co2e_cadx_per_proc else 0
+  annual_co2_total <- annual_co2_items + annual_co2_cadx
+  pv_co2_cost <- (annual_co2_total * carbon_cost_per_kg) * df_pv
+
+  cost_extended_pv <- cost_main_pv + pv_polyp_mgmt_cost + pv_co2_cost
+
+  # Effects remain inherited from sourced baseline CADe scenario.
+  # OD management changes costs and surveillance burden, not ARR inputs, in this overlay.
+  total_cols_over_horizon <- annual_volume * years
+  crc_prevented   <- arr_inc   * total_cols_over_horizon
+  death_prevented <- arr_death * total_cols_over_horizon
+
+  tibble(
+    Country = country,
+    Scenario = base_row[[col_scenario]],
+    OD_strategy = od_strategy,
+    Provider = provider,
+    Uses_CADx = uses_cadx,
+
+    p_shorter = surv$p_shorter,
+    p_longer  = surv$p_longer,
+
+    FU_per10k_base = fu_per10k0,
+    FU_per10k_od   = fu_per10k_od,
+
+    PV_device_base = pv_device0,
+    PV_cadx_capex  = pv_cadx_capex,
+    PV_fu_od       = pv_fu_od,
+
+    Main_cost_PV = cost_main_pv,
+
+    jars_per_proc = jars_per_proc,
+    polypectomy_rate = polyp_rate,
+    PV_polyp_mgmt_cost = pv_polyp_mgmt_cost,
+    PV_co2_cost = pv_co2_cost,
+
+    Extended_cost_PV = cost_extended_pv,
+
+    CRC_prevented = crc_prevented,
+    Deaths_prevented = death_prevented,
+
+    ICER_main_cost_per_CRC = safe_divide(Main_cost_PV, CRC_prevented),
+    ICER_extended_cost_per_CRC = safe_divide(Extended_cost_PV, CRC_prevented)
+  )
+}
+
+# -----------------------------
+# 7) RUN ALL OD ARMS
+# -----------------------------
+od_results <- baseline_tbl %>%
+  split(seq_len(nrow(.))) %>%
+  map_dfr(function(row_df) {
+    base_row <- row_df[1, ]
+    expand_grid(country = countries, od_arms) %>%
+      pmap_dfr(function(country, od_strategy, provider, uses_cadx) {
+        calc_od_costs(base_row, country, od_strategy, provider, uses_cadx)
+      })
+  })
+
+# -----------------------------
+# 8) SUMMARIES
+# -----------------------------
+summary_main <- od_results %>%
+  select(
+    Country, Scenario, OD_strategy, Provider, Uses_CADx,
+    Main_cost_PV, ICER_main_cost_per_CRC,
+    FU_per10k_od, PV_cadx_capex
+  ) %>%
+  arrange(Country, Scenario, OD_strategy, Provider)
+
+summary_extended <- od_results %>%
+  select(
+    Country, Scenario, OD_strategy, Provider, Uses_CADx,
+    Extended_cost_PV, ICER_extended_cost_per_CRC,
+    PV_polyp_mgmt_cost, PV_co2_cost, jars_per_proc, polypectomy_rate
+  ) %>%
+  arrange(Country, Scenario, OD_strategy, Provider)
+
+rad_discard_breakdown <- od_results %>%
+  filter(OD_strategy %in% c("RAD_NORMAL", "DISCARD_LITE")) %>%
+  mutate(
+    note = ifelse(
+      OD_strategy == "RAD_NORMAL",
+      "RAD-normal is a modelling assumption in this script. Jars are reduced by high-confidence diminutive polyps, and surveillance shorter/longer effects are assumed equal to DISCARD-lite.",
+      "DISCARD-lite inputs and surveillance shorter/longer counts are article-derived."
+    )
+  ) %>%
+  select(
+    Country, Scenario, OD_strategy, Provider, Uses_CADx,
+    p_shorter, p_longer, FU_per10k_od,
+    jars_per_proc, polypectomy_rate,
+    PV_polyp_mgmt_cost, PV_co2_cost, PV_cadx_capex,
+    Main_cost_PV, Extended_cost_PV, note
+  )
+
+# -----------------------------
+# 9) SIMPLE CRC TABLES
+# -----------------------------
+simple_crc_table <- od_results %>%
+  mutate(
+    OD_strategy = recode(
+      OD_strategy,
+      "RAD_NORMAL" = "RAD",
+      "DISCARD_LITE" = "DISCARD-lite",
+      "LIS" = "LIS"
+    ),
+    Arm = case_when(
+      Provider == "ENDO" ~ "CADe_only",
+      Provider == "CADX" ~ "CADe_plus_CADx",
+      TRUE ~ Provider
+    )
+  ) %>%
+  select(
+    Scenario,
+    Country,
+    OD_strategy,
+    Arm,
+    CRC_prevented,
+    Main_cost_PV,
+    Extended_cost_PV,
+    ICER_main_cost_per_CRC,
+    ICER_extended_cost_per_CRC
+  ) %>%
+  pivot_wider(
+    names_from = Arm,
+    values_from = c(
+      CRC_prevented,
+      Main_cost_PV,
+      Extended_cost_PV,
+      ICER_main_cost_per_CRC,
+      ICER_extended_cost_per_CRC
+    )
+  ) %>%
+  mutate(
+    Incremental_CADx_main_cost =
+      Main_cost_PV_CADe_plus_CADx - Main_cost_PV_CADe_only,
+    Incremental_CADx_extended_cost =
+      Extended_cost_PV_CADe_plus_CADx - Extended_cost_PV_CADe_only,
+    Incremental_CADx_main_cost_per_CRC =
+      safe_divide(Incremental_CADx_main_cost, CRC_prevented_CADe_only),
+    Incremental_CADx_extended_cost_per_CRC =
+      safe_divide(Incremental_CADx_extended_cost, CRC_prevented_CADe_only)
+  ) %>%
+  rename(
+    CRC_prevented = CRC_prevented_CADe_only
+  ) %>%
+  select(
+    Scenario,
+    Country,
+    OD_strategy,
+    CRC_prevented,
+    Main_cost_PV_CADe_only,
+    Main_cost_PV_CADe_plus_CADx,
+    Incremental_CADx_main_cost,
+    ICER_main_cost_per_CRC_CADe_only,
+    ICER_main_cost_per_CRC_CADe_plus_CADx,
+    Incremental_CADx_main_cost_per_CRC,
+    Extended_cost_PV_CADe_only,
+    Extended_cost_PV_CADe_plus_CADx,
+    Incremental_CADx_extended_cost,
+    ICER_extended_cost_per_CRC_CADe_only,
+    ICER_extended_cost_per_CRC_CADe_plus_CADx,
+    Incremental_CADx_extended_cost_per_CRC
+  ) %>%
+  arrange(Scenario, Country, OD_strategy)
+
+# optional consistency check
+stopifnot(
+  isTRUE(all.equal(
+    simple_crc_table$CRC_prevented,
+    od_results %>%
+      filter(Provider == "CADX") %>%
+      mutate(
+        OD_strategy = recode(
+          OD_strategy,
+          "RAD_NORMAL" = "RAD",
+          "DISCARD_LITE" = "DISCARD-lite",
+          "LIS" = "LIS"
+        )
+      ) %>%
+      arrange(Scenario, Country, OD_strategy) %>%
+      pull(CRC_prevented)
+  ))
+)
+
+simple_crc_table_fmt <- simple_crc_table %>%
+  mutate(
+    CRC_prevented = fmt_num(CRC_prevented, 0.01),
+    Main_cost_PV_CADe_only = fmt_dollar_na(Main_cost_PV_CADe_only, 1),
+    Main_cost_PV_CADe_plus_CADx = fmt_dollar_na(Main_cost_PV_CADe_plus_CADx, 1),
+    Incremental_CADx_main_cost = fmt_dollar_na(Incremental_CADx_main_cost, 1),
+    ICER_main_cost_per_CRC_CADe_only = fmt_dollar_na(ICER_main_cost_per_CRC_CADe_only, 1),
+    ICER_main_cost_per_CRC_CADe_plus_CADx = fmt_dollar_na(ICER_main_cost_per_CRC_CADe_plus_CADx, 1),
+    Incremental_CADx_main_cost_per_CRC = fmt_dollar_na(Incremental_CADx_main_cost_per_CRC, 1),
+    Extended_cost_PV_CADe_only = fmt_dollar_na(Extended_cost_PV_CADe_only, 1),
+    Extended_cost_PV_CADe_plus_CADx = fmt_dollar_na(Extended_cost_PV_CADe_plus_CADx, 1),
+    Incremental_CADx_extended_cost = fmt_dollar_na(Incremental_CADx_extended_cost, 1),
+    ICER_extended_cost_per_CRC_CADe_only = fmt_dollar_na(ICER_extended_cost_per_CRC_CADe_only, 1),
+    ICER_extended_cost_per_CRC_CADe_plus_CADx = fmt_dollar_na(ICER_extended_cost_per_CRC_CADe_plus_CADx, 1),
+    Incremental_CADx_extended_cost_per_CRC = fmt_dollar_na(Incremental_CADx_extended_cost_per_CRC, 1)
+  ) %>%
+  rename(
+    `CRC prevented` = CRC_prevented,
+    `CADe only main PV cost` = Main_cost_PV_CADe_only,
+    `CADe + CADx main PV cost` = Main_cost_PV_CADe_plus_CADx,
+    `Incremental CADx main cost` = Incremental_CADx_main_cost,
+    `CADe only main cost/CRC prevented` = ICER_main_cost_per_CRC_CADe_only,
+    `CADe + CADx main cost/CRC prevented` = ICER_main_cost_per_CRC_CADe_plus_CADx,
+    `Incremental CADx main cost/CRC prevented` = Incremental_CADx_main_cost_per_CRC,
+    `CADe only extended PV cost` = Extended_cost_PV_CADe_only,
+    `CADe + CADx extended PV cost` = Extended_cost_PV_CADe_plus_CADx,
+    `Incremental CADx extended cost` = Incremental_CADx_extended_cost,
+    `CADe only extended cost/CRC prevented` = ICER_extended_cost_per_CRC_CADe_only,
+    `CADe + CADx extended cost/CRC prevented` = ICER_extended_cost_per_CRC_CADe_plus_CADx,
+    `Incremental CADx extended cost/CRC prevented` = Incremental_CADx_extended_cost_per_CRC
+  )
+
+# -----------------------------
+# 10) EXPORT
+# -----------------------------
+downloads_dir <- file.path(Sys.getenv("USERPROFILE"), "Downloads")
+if (!dir.exists(downloads_dir)) downloads_dir <- getwd()
+
+out_file <- file.path(
+  downloads_dir,
+  paste0("CADe_OD_with_CADx_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".xlsx")
+)
+
+sheets <- list(
+  Baseline_CADe = baseline_tbl,
+  OD_Results_All = od_results,
+  Summary_Main = summary_main,
+  Summary_Extended = summary_extended,
+  Simple_CRC_Table = simple_crc_table,
+  Simple_CRC_Table_fmt = simple_crc_table_fmt,
+  RAD_and_DISCARD_Breakdown = rad_discard_breakdown,
+  Inputs_Surveillance_Table8 = surv_all,
+  Inputs_UnitCosts = unit_costs,
+  Inputs_OD_ResourceRates = od_resource_rates
+)
+
+safe_write_xlsx(sheets, out_file)
+message("DONE.")
