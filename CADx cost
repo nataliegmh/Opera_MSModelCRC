@@ -149,8 +149,6 @@ countries <- c("US", "UK", "JAPAN", "NORWAY")
 
 # CADx device price ($48,814) is taken from the published study.
 # Device life is adapted here to 10 years.
-# Confidence is not directly parameterised for LIS and DISCARD_LITE in this script.
-# Any confidence effect is implicit through the observed OD resource-use and surveillance inputs.
 cadx_device_capex_usd <- 48814
 cadx_device_life_years <- 10
 
@@ -188,28 +186,30 @@ od_resource_rates <- tribble(
     provider = norm_provider(provider)
   )
 
-# RAD-normal parameters.
-# RAD_NORMAL remains a modelling construct here.
-# It includes confidence explicitly through p_high_conf.
-rad_params <- list(
-  diminutive_polyps_per_proc = 1.51,
-  p_high_conf = 0.894,
-  polypectomy_rate = 0.58,
-  jars_baseline_total_removal = 1.51
-)
+# RAD-normal parameters, provider-specific.
+# Whole-colon RAD confidence is informed by Hassan et al. / CADx analysis study group 2024.
+# CADx-unassisted high-confidence = 87.8%; CADx-assisted high-confidence = 89.4%.
+# Polypectomy rate is kept equal in the base case, because confidence alone does not uniquely identify
+# a provider-specific polypectomy rate.
+rad_params <- tribble(
+  ~provider, ~diminutive_polyps_per_proc, ~p_high_conf, ~polypectomy_rate, ~jars_baseline_total_removal,
+  "ENDO",    1.51,                        0.878,        0.58,              1.51,
+  "CADX",    1.51,                        0.894,        0.58,              1.51
+) %>%
+  mutate(provider = norm_provider(provider))
 
 # -----------------------------
 # 4) SURVEILLANCE EFFECTS (Supplement Table 8s, N=1,134)
 # Table 8s surveillance reclassification is interpreted as a 10-year effect.
 # We annualise it over 10 years and apply it only over the first 10 years of the model horizon.
 # LIS and DISCARD_LITE are article-derived.
-# RAD_NORMAL is an assumption here: it uses the same shorter/longer surveillance effects as DISCARD_LITE.
+# RAD_NORMAL is derived from DISCARD_LITE and scaled by provider-specific RAD confidence.
 # -----------------------------
 N <- 1134
 
 surv_table8 <- tribble(
   ~country, ~od_strategy,      ~provider, ~p_shorter, ~p_longer,
-
+  
   "US",     "LIS",             "CADX",    4/N,        7/N,
   "US",     "LIS",             "ENDO",    3/N,        6/N,
   "UK",     "LIS",             "CADX",    0/N,        2/N,
@@ -218,7 +218,7 @@ surv_table8 <- tribble(
   "JAPAN",  "LIS",             "ENDO",    17/N,       8/N,
   "NORWAY", "LIS",             "CADX",    0/N,        1/N,
   "NORWAY", "LIS",             "ENDO",    0/N,        1/N,
-
+  
   "US",     "DISCARD_LITE",    "CADX",    55/N,       9/N,
   "US",     "DISCARD_LITE",    "ENDO",    49/N,       9/N,
   "UK",     "DISCARD_LITE",    "CADX",    5/N,        1/N,
@@ -234,12 +234,29 @@ surv_table8 <- tribble(
     provider = norm_provider(provider)
   )
 
-# RAD_NORMAL copied from DISCARD_LITE as a modelling assumption
+# Confidence reference for RAD scaling.
+# CADx confidence is used as the maximum implementation level.
+rad_conf_ref <- 0.894
+
+# RAD_NORMAL surveillance is derived from DISCARD_LITE and scaled by RAD confidence.
+# This is a modelled bridge because the source table does not provide whole-colon RAD confidence
+# outside the rectosigmoid.
 surv_rad_normal <- surv_table8 %>%
   filter(od_strategy == "DISCARD_LITE") %>%
-  mutate(od_strategy = "RAD_NORMAL")
+  left_join(
+    rad_params %>% select(provider, p_high_conf),
+    by = "provider"
+  ) %>%
+  mutate(
+    od_strategy = "RAD_NORMAL",
+    confidence_scale = pmin(p_high_conf / rad_conf_ref, 1),
+    p_shorter = p_shorter * confidence_scale,
+    p_longer  = p_longer  * confidence_scale
+  ) %>%
+  select(country, od_strategy, provider, p_shorter, p_longer)
 
-surv_all <- bind_rows(surv_table8, surv_rad_normal)
+surv_all <- bind_rows(surv_table8, surv_rad_normal) %>%
+  distinct(country, od_strategy, provider, .keep_all = TRUE)
 
 # -----------------------------
 # 5) OD ARMS
@@ -262,10 +279,11 @@ od_arms <- tribble(
 # 6) CORE COSTING FUNCTION
 # -----------------------------
 calc_od_costs <- function(base_row, country, od_strategy, provider, uses_cadx) {
-  country <- norm_country(country)
-  od_strategy <- norm_strategy(od_strategy)
-  provider <- norm_provider(provider)
-
+  
+  country <- as.character(norm_country(country))[1]
+  od_strategy <- as.character(norm_strategy(od_strategy))[1]
+  provider <- as.character(norm_provider(provider))[1]
+  
   annual_volume <- base_row[[col_annual_vol]]
   years         <- base_row[[col_years]]
   discount      <- base_row[[col_discount]]
@@ -274,52 +292,46 @@ calc_od_costs <- function(base_row, country, od_strategy, provider, uses_cadx) {
   pv_device0    <- base_row[[col_pv_device]]
   arr_inc       <- base_row[[col_arr_inc]]
   arr_death     <- base_row[[col_arr_death]]
-
+  
   df_pv <- pv_factor(years, discount)
-
-  surv <- surv_all %>%
-    filter(
-      .data$country == country,
-      .data$od_strategy == od_strategy,
-      .data$provider == provider
-    )
-
-  if (nrow(surv) != 1 && od_strategy == "RAD_NORMAL") {
-    surv <- surv_all %>%
-      filter(
-        .data$country == country,
-        .data$od_strategy == "DISCARD_LITE",
-        .data$provider == provider
-      )
-  }
-
+  
+  surv <- surv_all[
+    surv_all$country == country &
+      surv_all$od_strategy == od_strategy &
+      surv_all$provider == provider,
+    ,
+    drop = FALSE
+  ]
+  
   if (nrow(surv) != 1) {
+    print(list(
+      country = country,
+      od_strategy = od_strategy,
+      provider = provider
+    ))
+    print(surv_all)
     stop("Surveillance lookup failure for ", country, " / ", od_strategy, " / ", provider)
   }
-
-  # 10-year surveillance effect
-  d_fu_patient_10y <- delta_fu_per_patient_10y(
-    surv$p_shorter, surv$p_longer,
-    m_shorter = 1, m_longer = 1
-  )
+  
+  d_fu_patient_10y     <- delta_fu_per_patient_10y(surv$p_shorter, surv$p_longer, m_shorter = 1, m_longer = 1)
   d_fu_per10k_per_year <- (d_fu_patient_10y / 10) * 10000
-
-  # apply changed surveillance only over first 10 years
-  n_fu_years_changed <- min(years, 10L)
-
-  annual_fu_base <- (fu_per10k0 / 1e4) * annual_volume
-  annual_fu_od_changed <- ((fu_per10k0 + d_fu_per10k_per_year) / 1e4) * annual_volume
-
-  pv_fu_od <-
-    sum(annual_fu_od_changed * fu_cost / (1 + discount)^(seq_len(n_fu_years_changed))) +
-    if (years > n_fu_years_changed) {
-      sum(annual_fu_base * fu_cost / (1 + discount)^(seq.int(n_fu_years_changed + 1L, years)))
-    } else {
-      0
-    }
-
+  n_fu_years_changed   <- min(years, 10L)
+  
+  annual_fu_base       <- (fu_per10k0 / 10000) * annual_volume
+  annual_fu_od_changed <- ((fu_per10k0 + d_fu_per10k_per_year) / 10000) * annual_volume
+  
+  pv_fu_od <- sum(
+    annual_fu_od_changed * fu_cost / (1 + discount)^(seq_len(n_fu_years_changed))
+  ) + if (years > n_fu_years_changed) {
+    sum(
+      annual_fu_base * fu_cost / (1 + discount)^(seq.int(n_fu_years_changed + 1L, years))
+    )
+  } else {
+    0
+  }
+  
   fu_per10k_od <- fu_per10k0 + d_fu_per10k_per_year
-
+  
   pv_cadx_capex <- if (isTRUE(uses_cadx)) {
     pv_cadx_device_cost(
       discount = discount,
@@ -330,88 +342,107 @@ calc_od_costs <- function(base_row, country, od_strategy, provider, uses_cadx) {
   } else {
     0
   }
-
+  
   pv_device_od <- pv_device0 + pv_cadx_capex
   cost_main_pv <- pv_device_od + pv_fu_od
-
-  u <- unit_costs %>% filter(.data$country == country)
-  if (nrow(u) != 1) stop("Missing unit_costs for country: ", country)
-
+  
+  u <- unit_costs[
+    unit_costs$country == country,
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(u) != 1) {
+    stop("Missing unit_costs for country: ", country)
+  }
+  
   if (od_strategy %in% c("LIS", "DISCARD_LITE")) {
-    rr <- od_resource_rates %>% filter(.data$od_strategy == od_strategy, .data$provider == provider)
-    if (nrow(rr) != 1) stop("Missing od_resource_rates for ", od_strategy, " / ", provider)
+    rr <- od_resource_rates[
+      od_resource_rates$od_strategy == od_strategy &
+        od_resource_rates$provider == provider,
+      ,
+      drop = FALSE
+    ]
+    
+    if (nrow(rr) != 1) {
+      stop("Missing od_resource_rates for ", od_strategy, " / ", provider)
+    }
+    
     jars_per_proc <- rr$jars_per_proc[[1]]
     polyp_rate    <- rr$polypectomy_rate[[1]]
-  } else if (od_strategy == "RAD_NORMAL") {
-    polyp_rate <- rad_params$polypectomy_rate
-    saved_jars <- rad_params$p_high_conf * rad_params$diminutive_polyps_per_proc
-    jars_per_proc <- max(rad_params$jars_baseline_total_removal - saved_jars, 0)
+    
+  } else if (identical(od_strategy, "RAD_NORMAL")) {
+    rp <- rad_params[
+      rad_params$provider == provider,
+      ,
+      drop = FALSE
+    ]
+    
+    if (nrow(rp) != 1) {
+      stop("Missing rad_params for provider: ", provider)
+    }
+    
+    polyp_rate <- rp$polypectomy_rate[[1]]
+    saved_jars <- rp$p_high_conf[[1]] * rp$diminutive_polyps_per_proc[[1]]
+    jars_per_proc <- max(rp$jars_baseline_total_removal[[1]] - saved_jars, 0)
+    
   } else {
     stop("Unknown od_strategy: ", od_strategy)
   }
-
-  annual_procs <- annual_volume
+  
+  annual_procs         <- annual_volume
   annual_polypectomies <- polyp_rate * annual_procs
-
-  annual_snares <- annual_polypectomies
-  annual_traps  <- annual_polypectomies
-  annual_jars   <- jars_per_proc * annual_procs
-
-  annual_polyp_mgmt_cost <-
-    annual_snares * u$snare_cost +
+  annual_snares        <- annual_polypectomies
+  annual_traps         <- annual_polypectomies
+  annual_jars          <- jars_per_proc * annual_procs
+  
+  annual_polyp_mgmt_cost <- annual_snares * u$snare_cost +
     annual_traps * u$trap_cost +
     annual_jars * u$jar_cost
-
+  
   pv_polyp_mgmt_cost <- annual_polyp_mgmt_cost * df_pv
-
-  annual_co2_items <-
-    annual_snares * co2e_per_snare +
+  
+  annual_co2_items <- annual_snares * co2e_per_snare +
     annual_traps * co2e_per_trap +
     annual_jars * co2e_per_jar
-
-  annual_co2_cadx  <- if (isTRUE(uses_cadx)) annual_procs * co2e_cadx_per_proc else 0
+  
+  annual_co2_cadx <- if (isTRUE(uses_cadx)) {
+    annual_procs * co2e_cadx_per_proc
+  } else {
+    0
+  }
+  
   annual_co2_total <- annual_co2_items + annual_co2_cadx
-  pv_co2_cost <- (annual_co2_total * carbon_cost_per_kg) * df_pv
-
+  pv_co2_cost      <- (annual_co2_total * carbon_cost_per_kg) * df_pv
   cost_extended_pv <- cost_main_pv + pv_polyp_mgmt_cost + pv_co2_cost
-
-  # Effects remain inherited from sourced baseline CADe scenario.
-  # OD management changes costs and surveillance burden, not ARR inputs, in this overlay.
+  
   total_cols_over_horizon <- annual_volume * years
-  crc_prevented   <- arr_inc   * total_cols_over_horizon
-  death_prevented <- arr_death * total_cols_over_horizon
-
-  tibble(
-    Country = country,
-    Scenario = base_row[[col_scenario]],
-    OD_strategy = od_strategy,
-    Provider = provider,
-    Uses_CADx = uses_cadx,
-
-    p_shorter = surv$p_shorter,
-    p_longer  = surv$p_longer,
-
-    FU_per10k_base = fu_per10k0,
-    FU_per10k_od   = fu_per10k_od,
-
-    PV_device_base = pv_device0,
-    PV_cadx_capex  = pv_cadx_capex,
-    PV_fu_od       = pv_fu_od,
-
-    Main_cost_PV = cost_main_pv,
-
-    jars_per_proc = jars_per_proc,
-    polypectomy_rate = polyp_rate,
-    PV_polyp_mgmt_cost = pv_polyp_mgmt_cost,
-    PV_co2_cost = pv_co2_cost,
-
-    Extended_cost_PV = cost_extended_pv,
-
-    CRC_prevented = crc_prevented,
-    Deaths_prevented = death_prevented,
-
-    ICER_main_cost_per_CRC = safe_divide(Main_cost_PV, CRC_prevented),
-    ICER_extended_cost_per_CRC = safe_divide(Extended_cost_PV, CRC_prevented)
+  crc_prevented           <- arr_inc * total_cols_over_horizon
+  death_prevented         <- arr_death * total_cols_over_horizon
+  
+  tibble::tibble(
+    Country                    = country,
+    Scenario                   = base_row[[col_scenario]],
+    OD_strategy                = od_strategy,
+    Provider                   = provider,
+    Uses_CADx                  = uses_cadx,
+    p_shorter                  = surv$p_shorter,
+    p_longer                   = surv$p_longer,
+    FU_per10k_base             = fu_per10k0,
+    FU_per10k_od               = fu_per10k_od,
+    PV_device_base             = pv_device0,
+    PV_cadx_capex              = pv_cadx_capex,
+    PV_fu_od                   = pv_fu_od,
+    Main_cost_PV               = cost_main_pv,
+    jars_per_proc              = jars_per_proc,
+    polypectomy_rate           = polyp_rate,
+    PV_polyp_mgmt_cost         = pv_polyp_mgmt_cost,
+    PV_co2_cost                = pv_co2_cost,
+    Extended_cost_PV           = cost_extended_pv,
+    CRC_prevented              = crc_prevented,
+    Deaths_prevented           = death_prevented,
+    ICER_main_cost_per_CRC     = safe_divide(cost_main_pv, crc_prevented),
+    ICER_extended_cost_per_CRC = safe_divide(cost_extended_pv, crc_prevented)
   )
 }
 
@@ -420,10 +451,10 @@ calc_od_costs <- function(base_row, country, od_strategy, provider, uses_cadx) {
 # -----------------------------
 od_results <- baseline_tbl %>%
   split(seq_len(nrow(.))) %>%
-  map_dfr(function(row_df) {
+  purrr::map_dfr(function(row_df) {
     base_row <- row_df[1, ]
-    expand_grid(country = countries, od_arms) %>%
-      pmap_dfr(function(country, od_strategy, provider, uses_cadx) {
+    tidyr::expand_grid(country = countries, od_arms) %>%
+      purrr::pmap_dfr(function(country, od_strategy, provider, uses_cadx) {
         calc_od_costs(base_row, country, od_strategy, provider, uses_cadx)
       })
   })
@@ -432,31 +463,31 @@ od_results <- baseline_tbl %>%
 # 8) SUMMARIES
 # -----------------------------
 summary_main <- od_results %>%
-  select(
+  dplyr::select(
     Country, Scenario, OD_strategy, Provider, Uses_CADx,
     Main_cost_PV, ICER_main_cost_per_CRC,
     FU_per10k_od, PV_cadx_capex
   ) %>%
-  arrange(Country, Scenario, OD_strategy, Provider)
+  dplyr::arrange(Country, Scenario, OD_strategy, Provider, Uses_CADx)
 
 summary_extended <- od_results %>%
-  select(
+  dplyr::select(
     Country, Scenario, OD_strategy, Provider, Uses_CADx,
     Extended_cost_PV, ICER_extended_cost_per_CRC,
     PV_polyp_mgmt_cost, PV_co2_cost, jars_per_proc, polypectomy_rate
   ) %>%
-  arrange(Country, Scenario, OD_strategy, Provider)
+  dplyr::arrange(Country, Scenario, OD_strategy, Provider, Uses_CADx)
 
 rad_discard_breakdown <- od_results %>%
-  filter(OD_strategy %in% c("RAD_NORMAL", "DISCARD_LITE")) %>%
-  mutate(
+  dplyr::filter(OD_strategy %in% c("RAD_NORMAL", "DISCARD_LITE")) %>%
+  dplyr::mutate(
     note = ifelse(
       OD_strategy == "RAD_NORMAL",
-      "RAD-normal is a modelling assumption in this script. Jars are reduced by high-confidence diminutive polyps, and surveillance shorter/longer effects are assumed equal to DISCARD-lite.",
+      "RAD-normal surveillance is derived from DISCARD-lite and scaled by provider-specific whole-colon RAD confidence from external CADx resect-and-discard evidence. Jar use is reduced according to provider-specific high-confidence diagnosis.",
       "DISCARD-lite inputs and surveillance shorter/longer counts are article-derived."
     )
   ) %>%
-  select(
+  dplyr::select(
     Country, Scenario, OD_strategy, Provider, Uses_CADx,
     p_shorter, p_longer, FU_per10k_od,
     jars_per_proc, polypectomy_rate,
@@ -468,20 +499,20 @@ rad_discard_breakdown <- od_results %>%
 # 9) SIMPLE CRC TABLES
 # -----------------------------
 simple_crc_table <- od_results %>%
-  mutate(
-    OD_strategy = recode(
+  dplyr::mutate(
+    OD_strategy = dplyr::recode(
       OD_strategy,
       "RAD_NORMAL" = "RAD",
       "DISCARD_LITE" = "DISCARD-lite",
       "LIS" = "LIS"
     ),
-    Arm = case_when(
-      Provider == "ENDO" ~ "CADe_only",
-      Provider == "CADX" ~ "CADe_plus_CADx",
-      TRUE ~ Provider
+    Arm = dplyr::case_when(
+      Uses_CADx ~ "CADe_plus_CADx",
+      !Uses_CADx ~ "CADe_only",
+      TRUE ~ as.character(Provider)
     )
   ) %>%
-  select(
+  dplyr::select(
     Scenario,
     Country,
     OD_strategy,
@@ -492,7 +523,7 @@ simple_crc_table <- od_results %>%
     ICER_main_cost_per_CRC,
     ICER_extended_cost_per_CRC
   ) %>%
-  pivot_wider(
+  tidyr::pivot_wider(
     names_from = Arm,
     values_from = c(
       CRC_prevented,
@@ -502,7 +533,7 @@ simple_crc_table <- od_results %>%
       ICER_extended_cost_per_CRC
     )
   ) %>%
-  mutate(
+  dplyr::mutate(
     Incremental_CADx_main_cost =
       Main_cost_PV_CADe_plus_CADx - Main_cost_PV_CADe_only,
     Incremental_CADx_extended_cost =
@@ -512,10 +543,10 @@ simple_crc_table <- od_results %>%
     Incremental_CADx_extended_cost_per_CRC =
       safe_divide(Incremental_CADx_extended_cost, CRC_prevented_CADe_only)
   ) %>%
-  rename(
+  dplyr::rename(
     CRC_prevented = CRC_prevented_CADe_only
   ) %>%
-  select(
+  dplyr::select(
     Scenario,
     Country,
     OD_strategy,
@@ -533,29 +564,10 @@ simple_crc_table <- od_results %>%
     ICER_extended_cost_per_CRC_CADe_plus_CADx,
     Incremental_CADx_extended_cost_per_CRC
   ) %>%
-  arrange(Scenario, Country, OD_strategy)
-
-# optional consistency check
-stopifnot(
-  isTRUE(all.equal(
-    simple_crc_table$CRC_prevented,
-    od_results %>%
-      filter(Provider == "CADX") %>%
-      mutate(
-        OD_strategy = recode(
-          OD_strategy,
-          "RAD_NORMAL" = "RAD",
-          "DISCARD_LITE" = "DISCARD-lite",
-          "LIS" = "LIS"
-        )
-      ) %>%
-      arrange(Scenario, Country, OD_strategy) %>%
-      pull(CRC_prevented)
-  ))
-)
+  dplyr::arrange(Scenario, Country, OD_strategy)
 
 simple_crc_table_fmt <- simple_crc_table %>%
-  mutate(
+  dplyr::mutate(
     CRC_prevented = fmt_num(CRC_prevented, 0.01),
     Main_cost_PV_CADe_only = fmt_dollar_na(Main_cost_PV_CADe_only, 1),
     Main_cost_PV_CADe_plus_CADx = fmt_dollar_na(Main_cost_PV_CADe_plus_CADx, 1),
@@ -570,7 +582,7 @@ simple_crc_table_fmt <- simple_crc_table %>%
     ICER_extended_cost_per_CRC_CADe_plus_CADx = fmt_dollar_na(ICER_extended_cost_per_CRC_CADe_plus_CADx, 1),
     Incremental_CADx_extended_cost_per_CRC = fmt_dollar_na(Incremental_CADx_extended_cost_per_CRC, 1)
   ) %>%
-  rename(
+  dplyr::rename(
     `CRC prevented` = CRC_prevented,
     `CADe only main PV cost` = Main_cost_PV_CADe_only,
     `CADe + CADx main PV cost` = Main_cost_PV_CADe_plus_CADx,
@@ -584,6 +596,132 @@ simple_crc_table_fmt <- simple_crc_table %>%
     `CADe only extended cost/CRC prevented` = ICER_extended_cost_per_CRC_CADe_only,
     `CADe + CADx extended cost/CRC prevented` = ICER_extended_cost_per_CRC_CADe_plus_CADx,
     `Incremental CADx extended cost/CRC prevented` = Incremental_CADx_extended_cost_per_CRC
+  )
+
+# -----------------------------
+# 9B) COMPARE OD ARMS AGAINST NO OPTICAL DIAGNOSIS
+# -----------------------------
+baseline_no_od <- tidyr::expand_grid(
+  Country = as.character(norm_country(countries)),
+  baseline_tbl
+) %>%
+  dplyr::transmute(
+    Country = Country,
+    Scenario = .data[[col_scenario]],
+    No_OD_FU_per10k = .data[[col_fu_per10k]],
+    No_OD_PV_device = .data[[col_pv_device]],
+    No_OD_fu_cost = .data[[col_fu_cost]],
+    No_OD_annual_volume = .data[[col_annual_vol]],
+    No_OD_years = .data[[col_years]],
+    No_OD_discount = .data[[col_discount]],
+    No_OD_arr_inc = .data[[col_arr_inc]],
+    No_OD_arr_death = .data[[col_arr_death]]
+  ) %>%
+  dplyr::distinct(Country, Scenario, .keep_all = TRUE)
+
+baseline_no_od <- baseline_no_od %>%
+  dplyr::mutate(
+    No_OD_df_pv = mapply(pv_factor, No_OD_years, No_OD_discount),
+    No_OD_annual_fu = (No_OD_FU_per10k / 10000) * No_OD_annual_volume,
+    No_OD_PV_fu = No_OD_annual_fu * No_OD_fu_cost * No_OD_df_pv,
+    No_OD_Main_cost_PV = No_OD_PV_device + No_OD_PV_fu
+  )
+
+baseline_no_od <- baseline_no_od %>%
+  dplyr::left_join(
+    unit_costs %>%
+      dplyr::mutate(Country = as.character(norm_country(country))) %>%
+      dplyr::select(Country, snare_cost, trap_cost, jar_cost),
+    by = "Country"
+  ) %>%
+  dplyr::mutate(
+    baseline_polypectomy_rate = 0.58,
+    baseline_jars_per_proc = 1.51,
+    baseline_annual_polypectomies = baseline_polypectomy_rate * No_OD_annual_volume,
+    baseline_annual_snares = baseline_annual_polypectomies,
+    baseline_annual_traps = baseline_annual_polypectomies,
+    baseline_annual_jars = baseline_jars_per_proc * No_OD_annual_volume,
+    baseline_annual_polyp_mgmt_cost =
+      baseline_annual_snares * snare_cost +
+      baseline_annual_traps * trap_cost +
+      baseline_annual_jars * jar_cost,
+    No_OD_PV_polyp_mgmt_cost = baseline_annual_polyp_mgmt_cost * No_OD_df_pv,
+    baseline_annual_co2 =
+      baseline_annual_snares * co2e_per_snare +
+      baseline_annual_traps * co2e_per_trap +
+      baseline_annual_jars * co2e_per_jar,
+    No_OD_PV_co2_cost = (baseline_annual_co2 * carbon_cost_per_kg) * No_OD_df_pv,
+    No_OD_Extended_cost_PV =
+      No_OD_Main_cost_PV + No_OD_PV_polyp_mgmt_cost + No_OD_PV_co2_cost,
+    No_OD_CRC_prevented = No_OD_arr_inc * (No_OD_annual_volume * No_OD_years),
+    No_OD_Deaths_prevented = No_OD_arr_death * (No_OD_annual_volume * No_OD_years)
+  )
+
+od_vs_no_od <- od_results %>%
+  dplyr::left_join(
+    baseline_no_od %>%
+      dplyr::select(
+        Country, Scenario,
+        No_OD_Main_cost_PV,
+        No_OD_Extended_cost_PV,
+        No_OD_CRC_prevented,
+        No_OD_Deaths_prevented
+      ),
+    by = c("Country", "Scenario")
+  ) %>%
+  dplyr::mutate(
+    Incremental_main_cost_vs_No_OD =
+      Main_cost_PV - No_OD_Main_cost_PV,
+    Incremental_extended_cost_vs_No_OD =
+      Extended_cost_PV - No_OD_Extended_cost_PV,
+    Incremental_CRC_prevented_vs_No_OD =
+      CRC_prevented - No_OD_CRC_prevented,
+    Incremental_deaths_prevented_vs_No_OD =
+      Deaths_prevented - No_OD_Deaths_prevented,
+    Incremental_main_cost_per_CRC_vs_No_OD =
+      safe_divide(Incremental_main_cost_vs_No_OD, Incremental_CRC_prevented_vs_No_OD),
+    Incremental_extended_cost_per_CRC_vs_No_OD =
+      safe_divide(Incremental_extended_cost_vs_No_OD, Incremental_CRC_prevented_vs_No_OD)
+  ) %>%
+  dplyr::arrange(Scenario, Country, OD_strategy, Provider, Uses_CADx)
+
+summary_vs_no_od <- od_vs_no_od %>%
+  dplyr::mutate(
+    Comparator = "No optical diagnosis"
+  ) %>%
+  dplyr::select(
+    Scenario,
+    Country,
+    Comparator,
+    OD_strategy,
+    Provider,
+    Uses_CADx,
+    No_OD_CRC_prevented,
+    CRC_prevented,
+    Incremental_CRC_prevented_vs_No_OD,
+    No_OD_Main_cost_PV,
+    Main_cost_PV,
+    Incremental_main_cost_vs_No_OD,
+    No_OD_Extended_cost_PV,
+    Extended_cost_PV,
+    Incremental_extended_cost_vs_No_OD,
+    Incremental_main_cost_per_CRC_vs_No_OD,
+    Incremental_extended_cost_per_CRC_vs_No_OD
+  )
+
+summary_vs_no_od_fmt <- summary_vs_no_od %>%
+  dplyr::mutate(
+    No_OD_CRC_prevented = fmt_num(No_OD_CRC_prevented, 0.01),
+    CRC_prevented = fmt_num(CRC_prevented, 0.01),
+    Incremental_CRC_prevented_vs_No_OD = fmt_num(Incremental_CRC_prevented_vs_No_OD, 0.01),
+    No_OD_Main_cost_PV = fmt_dollar_na(No_OD_Main_cost_PV, 1),
+    Main_cost_PV = fmt_dollar_na(Main_cost_PV, 1),
+    Incremental_main_cost_vs_No_OD = fmt_dollar_na(Incremental_main_cost_vs_No_OD, 1),
+    No_OD_Extended_cost_PV = fmt_dollar_na(No_OD_Extended_cost_PV, 1),
+    Extended_cost_PV = fmt_dollar_na(Extended_cost_PV, 1),
+    Incremental_extended_cost_vs_No_OD = fmt_dollar_na(Incremental_extended_cost_vs_No_OD, 1),
+    Incremental_main_cost_per_CRC_vs_No_OD = fmt_dollar_na(Incremental_main_cost_per_CRC_vs_No_OD, 1),
+    Incremental_extended_cost_per_CRC_vs_No_OD = fmt_dollar_na(Incremental_extended_cost_per_CRC_vs_No_OD, 1)
   )
 
 # -----------------------------
@@ -604,11 +742,154 @@ sheets <- list(
   Summary_Extended = summary_extended,
   Simple_CRC_Table = simple_crc_table,
   Simple_CRC_Table_fmt = simple_crc_table_fmt,
+  OD_vs_No_OD = od_vs_no_od,
+  Summary_vs_No_OD = summary_vs_no_od,
+  Summary_vs_No_OD_fmt = summary_vs_no_od_fmt,
   RAD_and_DISCARD_Breakdown = rad_discard_breakdown,
   Inputs_Surveillance_Table8 = surv_all,
   Inputs_UnitCosts = unit_costs,
-  Inputs_OD_ResourceRates = od_resource_rates
+  Inputs_OD_ResourceRates = od_resource_rates,
+  Inputs_RAD_Params = rad_params
 )
 
 safe_write_xlsx(sheets, out_file)
 message("DONE.")
+
+# -----------------------------
+# 11) READER-FACING MINIMAL EXPORT
+# Exports only the most interpretable values for the reader.
+# Focus is on whether adding CADx is cost-increasing or cost-saving.
+# -----------------------------
+
+reader_key_table <- simple_crc_table %>%
+  dplyr::mutate(
+    CADx_main_direction = dplyr::case_when(
+      Incremental_CADx_main_cost < 0 ~ "Cost-saving",
+      Incremental_CADx_main_cost > 0 ~ "Cost-increasing",
+      TRUE ~ "No difference"
+    ),
+    CADx_extended_direction = dplyr::case_when(
+      Incremental_CADx_extended_cost < 0 ~ "Cost-saving",
+      Incremental_CADx_extended_cost > 0 ~ "Cost-increasing",
+      TRUE ~ "No difference"
+    ),
+    Conclusion = dplyr::case_when(
+      Incremental_CADx_main_cost > 0 & Incremental_CADx_extended_cost < 0 ~
+        "CADx increases main costs but is cost-saving when downstream polyp-management and carbon costs are included.",
+      Incremental_CADx_main_cost > 0 & Incremental_CADx_extended_cost > 0 ~
+        "CADx is cost-increasing under both the main-cost and extended-cost frameworks.",
+      Incremental_CADx_main_cost < 0 & Incremental_CADx_extended_cost < 0 ~
+        "CADx is cost-saving under both the main-cost and extended-cost frameworks.",
+      Incremental_CADx_main_cost < 0 & Incremental_CADx_extended_cost > 0 ~
+        "CADx is cost-saving under the main-cost framework but cost-increasing under the extended-cost framework.",
+      TRUE ~
+        "CADx has no clear cost difference in at least one framework."
+    )
+  ) %>%
+  dplyr::select(
+    Scenario,
+    Country,
+    OD_strategy,
+    CRC_prevented,
+    Incremental_CADx_main_cost,
+    CADx_main_direction,
+    Incremental_CADx_main_cost_per_CRC,
+    Incremental_CADx_extended_cost,
+    CADx_extended_direction,
+    Incremental_CADx_extended_cost_per_CRC,
+    Conclusion
+  ) %>%
+  dplyr::arrange(Scenario, Country, OD_strategy)
+
+reader_key_table_fmt <- reader_key_table %>%
+  dplyr::mutate(
+    CRC_prevented = fmt_num(CRC_prevented, 0.01),
+    Incremental_CADx_main_cost = fmt_dollar_na(Incremental_CADx_main_cost, 1),
+    Incremental_CADx_main_cost_per_CRC = fmt_dollar_na(Incremental_CADx_main_cost_per_CRC, 1),
+    Incremental_CADx_extended_cost = fmt_dollar_na(Incremental_CADx_extended_cost, 1),
+    Incremental_CADx_extended_cost_per_CRC = fmt_dollar_na(Incremental_CADx_extended_cost_per_CRC, 1)
+  ) %>%
+  dplyr::rename(
+    `CRC prevented` = CRC_prevented,
+    `Incremental CADx main cost` = Incremental_CADx_main_cost,
+    `Main-cost interpretation` = CADx_main_direction,
+    `Incremental CADx main cost per CRC prevented` = Incremental_CADx_main_cost_per_CRC,
+    `Incremental CADx extended cost` = Incremental_CADx_extended_cost,
+    `Extended-cost interpretation` = CADx_extended_direction,
+    `Incremental CADx extended cost per CRC prevented` = Incremental_CADx_extended_cost_per_CRC
+  )
+
+reader_short_summary <- simple_crc_table %>%
+  dplyr::mutate(
+    Main_cost_result = dplyr::case_when(
+      Incremental_CADx_main_cost < 0 ~ "CADx saves money",
+      Incremental_CADx_main_cost > 0 ~ "CADx costs more",
+      TRUE ~ "No difference"
+    ),
+    Extended_cost_result = dplyr::case_when(
+      Incremental_CADx_extended_cost < 0 ~ "CADx saves money",
+      Incremental_CADx_extended_cost > 0 ~ "CADx costs more",
+      TRUE ~ "No difference"
+    ),
+    Conclusion = dplyr::case_when(
+      Incremental_CADx_main_cost > 0 & Incremental_CADx_extended_cost < 0 ~
+        "CADx costs more under the main-cost framework but saves money under the extended-cost framework.",
+      Incremental_CADx_main_cost > 0 & Incremental_CADx_extended_cost > 0 ~
+        "CADx costs more under both frameworks.",
+      Incremental_CADx_main_cost < 0 & Incremental_CADx_extended_cost < 0 ~
+        "CADx saves money under both frameworks.",
+      Incremental_CADx_main_cost < 0 & Incremental_CADx_extended_cost > 0 ~
+        "CADx saves money under the main-cost framework but costs more under the extended-cost framework.",
+      TRUE ~
+        "CADx has no clear cost difference in at least one framework."
+    )
+  ) %>%
+  dplyr::select(
+    Scenario,
+    Country,
+    OD_strategy,
+    Main_cost_result,
+    Extended_cost_result,
+    Conclusion
+  ) %>%
+  dplyr::arrange(Scenario, Country, OD_strategy)
+
+# Optional: only rows where CADx is cost-saving under the extended-cost framework
+reader_cost_saving_only <- reader_key_table %>%
+  dplyr::filter(Incremental_CADx_extended_cost < 0) %>%
+  dplyr::arrange(Scenario, Country, OD_strategy)
+
+reader_cost_saving_only_fmt <- reader_cost_saving_only %>%
+  dplyr::mutate(
+    CRC_prevented = fmt_num(CRC_prevented, 0.01),
+    Incremental_CADx_main_cost = fmt_dollar_na(Incremental_CADx_main_cost, 1),
+    Incremental_CADx_main_cost_per_CRC = fmt_dollar_na(Incremental_CADx_main_cost_per_CRC, 1),
+    Incremental_CADx_extended_cost = fmt_dollar_na(Incremental_CADx_extended_cost, 1),
+    Incremental_CADx_extended_cost_per_CRC = fmt_dollar_na(Incremental_CADx_extended_cost_per_CRC, 1)
+  ) %>%
+  dplyr::rename(
+    `CRC prevented` = CRC_prevented,
+    `Incremental CADx main cost` = Incremental_CADx_main_cost,
+    `Main-cost interpretation` = CADx_main_direction,
+    `Incremental CADx main cost per CRC prevented` = Incremental_CADx_main_cost_per_CRC,
+    `Incremental CADx extended cost` = Incremental_CADx_extended_cost,
+    `Extended-cost interpretation` = CADx_extended_direction,
+    `Incremental CADx extended cost per CRC prevented` = Incremental_CADx_extended_cost_per_CRC
+  )
+
+# Write a second, minimal workbook for readers
+reader_out_file <- file.path(
+  downloads_dir,
+  paste0("CADe_OD_reader_summary_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".xlsx")
+)
+
+reader_sheets <- list(
+  Reader_Key_Table = reader_key_table,
+  Reader_Key_Table_fmt = reader_key_table_fmt,
+  Reader_Short_Summary = reader_short_summary,
+  Cost_Saving_Extended_Only = reader_cost_saving_only,
+  Cost_Saving_Extended_Only_fmt = reader_cost_saving_only_fmt
+)
+
+safe_write_xlsx(reader_sheets, reader_out_file)
+message("READER SUMMARY DONE.")
