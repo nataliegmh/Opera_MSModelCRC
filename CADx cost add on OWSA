@@ -1,0 +1,521 @@
+#### ADD-ON: ONE-WAY SENSITIVITY ANALYSIS
+#### Parameters:
+#### 1) follow-up colonoscopy cost
+#### 2) CADx device cost
+#### 3) histopathology submission cost (jar_cost)
+####
+#### Run this AFTER the main code.
+#### This add-on uses pooled surveillance effects with equal country weights.
+#### Output focuses on EXTENDED cost per CRC prevented.
+
+# -----------------------------
+# A) CHECK REQUIRED OBJECTS
+# -----------------------------
+required_objects <- c(
+  "baseline_tbl", "countries", "od_arms", "surv_all", "unit_costs",
+  "safe_divide", "pv_factor", "pv_cadx_device_cost",
+  "norm_country", "norm_provider", "norm_strategy",
+  "delta_fu_per_patient_10y", "fmt_num", "fmt_dollar_na",
+  "cadx_device_capex_usd", "cadx_device_life_years",
+  "co2e_per_snare", "co2e_per_trap", "co2e_per_jar", "co2e_cadx_per_proc",
+  "carbon_cost_per_kg",
+  "col_scenario", "col_annual_vol", "col_years", "col_discount",
+  "col_fu_cost", "col_fu_per10k", "col_pv_device", "col_arr_inc", "col_arr_death",
+  "od_resource_rates", "rad_params", "safe_write_xlsx"
+)
+
+missing_objects <- required_objects[!vapply(required_objects, exists, logical(1))]
+if (length(missing_objects) > 0) {
+  stop("These required objects are missing from the environment: ",
+       paste(missing_objects, collapse = ", "),
+       "\nRun the main script first.")
+}
+
+# -----------------------------
+# B) USER SETTINGS
+# -----------------------------
+# Default one-way multipliers. Change if needed.
+sensitivity_levels <- c(
+  low  = 0.5,
+  base = 1.0,
+  high = 1.5
+)
+
+# Equal country weights for pooling
+pooled_country_weights <- c(
+  US = 1,
+  UK = 1,
+  JAPAN = 1,
+  NORWAY = 1
+)
+
+pooled_country_weights <- pooled_country_weights[names(pooled_country_weights) %in% unique(norm_country(countries))]
+if (length(pooled_country_weights) == 0) {
+  stop("No valid pooled_country_weights matched the countries in the analysis.")
+}
+
+country_weight_tbl <- tibble::tibble(
+  Country = names(pooled_country_weights),
+  country_weight = as.numeric(pooled_country_weights)
+)
+
+# -----------------------------
+# C) BUILD POOLED SURVEILLANCE TABLE
+# -----------------------------
+surv_all_pooled_sens <- surv_all %>%
+  dplyr::filter(od_strategy %in% c("LIS", "DISCARD_LITE", "RAD_NORMAL")) %>%
+  dplyr::mutate(weight = unname(pooled_country_weights[country])) %>%
+  dplyr::group_by(od_strategy, provider) %>%
+  dplyr::summarise(
+    p_shorter = stats::weighted.mean(p_shorter, w = weight, na.rm = TRUE),
+    p_longer  = stats::weighted.mean(p_longer,  w = weight, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# -----------------------------
+# D) CORE RUNNER FOR ONE SENSITIVITY SETTING
+# -----------------------------
+run_sensitivity_case <- function(
+  fu_cost_multiplier   = 1,
+  cadx_cost_multiplier = 1,
+  histo_cost_multiplier = 1,
+  sensitivity_parameter = "base_case",
+  sensitivity_level = "base"
+) {
+
+  baseline_tbl_sens <- baseline_tbl
+  baseline_tbl_sens[[col_fu_cost]] <- baseline_tbl_sens[[col_fu_cost]] * fu_cost_multiplier
+
+  unit_costs_sens <- unit_costs
+  unit_costs_sens$jar_cost <- unit_costs_sens$jar_cost * histo_cost_multiplier
+
+  cadx_device_capex_usd_sens <- cadx_device_capex_usd * cadx_cost_multiplier
+
+  calc_od_costs_pooled_surv_sens <- function(base_row, country, od_strategy, provider, uses_cadx) {
+
+    country <- as.character(norm_country(country))[1]
+    od_strategy <- as.character(norm_strategy(od_strategy))[1]
+    provider <- as.character(norm_provider(provider))[1]
+
+    annual_volume <- base_row[[col_annual_vol]]
+    years         <- base_row[[col_years]]
+    discount      <- base_row[[col_discount]]
+    fu_cost       <- base_row[[col_fu_cost]]
+    fu_per10k0    <- base_row[[col_fu_per10k]]
+    pv_device0    <- base_row[[col_pv_device]]
+    arr_inc       <- base_row[[col_arr_inc]]
+    arr_death     <- base_row[[col_arr_death]]
+
+    df_pv <- pv_factor(years, discount)
+
+    surv <- surv_all_pooled_sens[
+      surv_all_pooled_sens$od_strategy == od_strategy &
+        surv_all_pooled_sens$provider == provider,
+      ,
+      drop = FALSE
+    ]
+
+    if (nrow(surv) != 1) {
+      stop("Pooled surveillance lookup failure for ", od_strategy, " / ", provider)
+    }
+
+    d_fu_patient_10y     <- delta_fu_per_patient_10y(surv$p_shorter, surv$p_longer, m_shorter = 1, m_longer = 1)
+    d_fu_per10k_per_year <- (d_fu_patient_10y / 10) * 10000
+    n_fu_years_changed   <- min(years, 10L)
+
+    annual_fu_base       <- (fu_per10k0 / 10000) * annual_volume
+    annual_fu_od_changed <- ((fu_per10k0 + d_fu_per10k_per_year) / 10000) * annual_volume
+
+    pv_fu_od <- sum(
+      annual_fu_od_changed * fu_cost / (1 + discount)^(seq_len(n_fu_years_changed))
+    ) + if (years > n_fu_years_changed) {
+      sum(
+        annual_fu_base * fu_cost / (1 + discount)^(seq.int(n_fu_years_changed + 1L, years))
+      )
+    } else {
+      0
+    }
+
+    pv_cadx_capex <- if (isTRUE(uses_cadx)) {
+      pv_cadx_device_cost(
+        discount = discount,
+        scenario_years = years,
+        cadx_device_capex_usd = cadx_device_capex_usd_sens,
+        cadx_device_life_years = cadx_device_life_years
+      )
+    } else {
+      0
+    }
+
+    pv_device_od <- pv_device0 + pv_cadx_capex
+    cost_main_pv <- pv_device_od + pv_fu_od
+
+    u <- unit_costs_sens[
+      unit_costs_sens$country == country,
+      ,
+      drop = FALSE
+    ]
+
+    if (nrow(u) != 1) {
+      stop("Missing unit_costs for country: ", country)
+    }
+
+    if (od_strategy %in% c("LIS", "DISCARD_LITE")) {
+      rr <- od_resource_rates[
+        od_resource_rates$od_strategy == od_strategy &
+          od_resource_rates$provider == provider,
+        ,
+        drop = FALSE
+      ]
+
+      if (nrow(rr) != 1) {
+        stop("Missing od_resource_rates for ", od_strategy, " / ", provider)
+      }
+
+      jars_per_proc <- rr$jars_per_proc[[1]]
+      polyp_rate    <- rr$polypectomy_rate[[1]]
+
+    } else if (identical(od_strategy, "RAD_NORMAL")) {
+      rp <- rad_params[
+        rad_params$provider == provider,
+        ,
+        drop = FALSE
+      ]
+
+      if (nrow(rp) != 1) {
+        stop("Missing rad_params for provider: ", provider)
+      }
+
+      polyp_rate <- rp$polypectomy_rate[[1]]
+
+      eligible_polyps   <- rp$eligible_diminutive_polyps_per_proc[[1]]
+      noneligible_jars  <- rp$noneligible_jars_per_proc[[1]]
+      p_avoid_pathology <- rp$p_avoid_pathology[[1]]
+
+      jars_per_proc <- noneligible_jars + eligible_polyps * (1 - p_avoid_pathology)
+
+    } else {
+      stop("Unknown od_strategy: ", od_strategy)
+    }
+
+    annual_procs         <- annual_volume
+    annual_polypectomies <- polyp_rate * annual_procs
+    annual_snares        <- annual_polypectomies
+    annual_traps         <- annual_polypectomies
+    annual_jars          <- jars_per_proc * annual_procs
+
+    annual_polyp_mgmt_cost <- annual_snares * u$snare_cost +
+      annual_traps * u$trap_cost +
+      annual_jars * u$jar_cost
+
+    pv_polyp_mgmt_cost <- annual_polyp_mgmt_cost * df_pv
+
+    annual_co2_items <- annual_snares * co2e_per_snare +
+      annual_traps * co2e_per_trap +
+      annual_jars * co2e_per_jar
+
+    annual_co2_cadx <- if (isTRUE(uses_cadx)) {
+      annual_procs * co2e_cadx_per_proc
+    } else {
+      0
+    }
+
+    annual_co2_total <- annual_co2_items + annual_co2_cadx
+    pv_co2_cost      <- (annual_co2_total * carbon_cost_per_kg) * df_pv
+    cost_extended_pv <- cost_main_pv + pv_polyp_mgmt_cost + pv_co2_cost
+
+    total_cols_over_horizon <- annual_volume * years
+    crc_prevented           <- arr_inc * total_cols_over_horizon
+
+    tibble::tibble(
+      Country                    = country,
+      Scenario                   = base_row[[col_scenario]],
+      OD_strategy                = od_strategy,
+      Provider                   = provider,
+      Uses_CADx                  = uses_cadx,
+      Extended_cost_PV           = cost_extended_pv,
+      CRC_prevented              = crc_prevented,
+      ICER_extended_cost_per_CRC = safe_divide(cost_extended_pv, crc_prevented),
+      sensitivity_parameter      = sensitivity_parameter,
+      sensitivity_level          = sensitivity_level
+    )
+  }
+
+  # OD results
+  od_results_sens <- baseline_tbl_sens %>%
+    split(seq_len(nrow(.))) %>%
+    purrr::map_dfr(function(row_df) {
+      base_row <- row_df[1, ]
+      tidyr::expand_grid(country = countries, od_arms) %>%
+        purrr::pmap_dfr(function(country, od_strategy, provider, uses_cadx) {
+          calc_od_costs_pooled_surv_sens(base_row, country, od_strategy, provider, uses_cadx)
+        })
+    })
+
+  # No optical diagnosis
+  baseline_no_od_sens <- tidyr::expand_grid(
+    Country = as.character(norm_country(countries)),
+    baseline_tbl_sens
+  ) %>%
+    dplyr::transmute(
+      Country = Country,
+      Scenario = .data[[col_scenario]],
+      No_OD_FU_per10k = .data[[col_fu_per10k]],
+      No_OD_PV_device = .data[[col_pv_device]],
+      No_OD_fu_cost = .data[[col_fu_cost]],
+      No_OD_annual_volume = .data[[col_annual_vol]],
+      No_OD_years = .data[[col_years]],
+      No_OD_discount = .data[[col_discount]],
+      No_OD_arr_inc = .data[[col_arr_inc]]
+    ) %>%
+    dplyr::distinct(Country, Scenario, .keep_all = TRUE) %>%
+    dplyr::left_join(
+      unit_costs_sens %>%
+        dplyr::mutate(Country = as.character(norm_country(country))) %>%
+        dplyr::select(Country, snare_cost, trap_cost, jar_cost),
+      by = "Country"
+    ) %>%
+    dplyr::mutate(
+      No_OD_df_pv = mapply(pv_factor, No_OD_years, No_OD_discount),
+      baseline_polypectomy_rate = 0.58,
+      baseline_jars_per_proc = 1.51,
+      baseline_annual_polypectomies = baseline_polypectomy_rate * No_OD_annual_volume,
+      baseline_annual_snares = baseline_annual_polypectomies,
+      baseline_annual_traps = baseline_annual_polypectomies,
+      baseline_annual_jars = baseline_jars_per_proc * No_OD_annual_volume,
+      No_OD_annual_fu = (No_OD_FU_per10k / 10000) * No_OD_annual_volume,
+      No_OD_PV_fu = No_OD_annual_fu * No_OD_fu_cost * No_OD_df_pv,
+      baseline_annual_polyp_mgmt_cost =
+        baseline_annual_snares * snare_cost +
+        baseline_annual_traps * trap_cost +
+        baseline_annual_jars * jar_cost,
+      No_OD_PV_polyp_mgmt_cost = baseline_annual_polyp_mgmt_cost * No_OD_df_pv,
+      baseline_annual_co2 =
+        baseline_annual_snares * co2e_per_snare +
+        baseline_annual_traps * co2e_per_trap +
+        baseline_annual_jars * co2e_per_jar,
+      No_OD_PV_co2_cost = (baseline_annual_co2 * carbon_cost_per_kg) * No_OD_df_pv,
+      No_OD_Extended_cost_PV =
+        No_OD_PV_device + No_OD_PV_fu + No_OD_PV_polyp_mgmt_cost + No_OD_PV_co2_cost,
+      No_OD_CRC_prevented = No_OD_arr_inc * (No_OD_annual_volume * No_OD_years),
+      No_OD_ICER_extended_cost_per_CRC = safe_divide(No_OD_Extended_cost_PV, No_OD_CRC_prevented),
+      sensitivity_parameter = sensitivity_parameter,
+      sensitivity_level = sensitivity_level
+    )
+
+  # Three-group country-level table
+  od_three_group_country <- od_results_sens %>%
+    dplyr::mutate(
+      OD_strategy = dplyr::recode(
+        OD_strategy,
+        "RAD_NORMAL" = "RAD",
+        "DISCARD_LITE" = "DISCARD-lite",
+        "LIS" = "LIS"
+      ),
+      Arm = dplyr::case_when(
+        Provider == "ENDO" & !Uses_CADx ~ "Endoscopist_OD",
+        Provider == "CADX" & Uses_CADx ~ "CADx_OD",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    dplyr::select(
+      Country, Scenario, OD_strategy, Arm,
+      ICER_extended_cost_per_CRC,
+      sensitivity_parameter, sensitivity_level
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = Arm,
+      values_from = ICER_extended_cost_per_CRC
+    ) %>%
+    dplyr::left_join(
+      baseline_no_od_sens %>%
+        dplyr::select(
+          Country, Scenario,
+          No_OD_ICER_extended_cost_per_CRC,
+          sensitivity_parameter, sensitivity_level
+        ),
+      by = c("Country", "Scenario", "sensitivity_parameter", "sensitivity_level")
+    ) %>%
+    dplyr::mutate(
+      Incremental_Endoscopist_OD_vs_No_OD =
+        Endoscopist_OD - No_OD_ICER_extended_cost_per_CRC,
+      Incremental_CADx_OD_vs_Endoscopist_OD =
+        CADx_OD - Endoscopist_OD,
+      Incremental_CADx_OD_vs_No_OD =
+        CADx_OD - No_OD_ICER_extended_cost_per_CRC
+    ) %>%
+    dplyr::arrange(sensitivity_parameter, sensitivity_level, Scenario, Country, OD_strategy)
+
+  # Pooled across countries
+  od_three_group_pooled <- od_three_group_country %>%
+    dplyr::left_join(country_weight_tbl, by = "Country") %>%
+    dplyr::group_by(sensitivity_parameter, sensitivity_level, Scenario, OD_strategy) %>%
+    dplyr::summarise(
+      No_OD_extended_cost_per_CRC =
+        stats::weighted.mean(No_OD_ICER_extended_cost_per_CRC, w = country_weight, na.rm = TRUE),
+      Endoscopist_OD_extended_cost_per_CRC =
+        stats::weighted.mean(Endoscopist_OD, w = country_weight, na.rm = TRUE),
+      CADx_OD_extended_cost_per_CRC =
+        stats::weighted.mean(CADx_OD, w = country_weight, na.rm = TRUE),
+      Incremental_Endoscopist_OD_vs_No_OD =
+        stats::weighted.mean(Incremental_Endoscopist_OD_vs_No_OD, w = country_weight, na.rm = TRUE),
+      Incremental_CADx_OD_vs_Endoscopist_OD =
+        stats::weighted.mean(Incremental_CADx_OD_vs_Endoscopist_OD, w = country_weight, na.rm = TRUE),
+      Incremental_CADx_OD_vs_No_OD =
+        stats::weighted.mean(Incremental_CADx_OD_vs_No_OD, w = country_weight, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(sensitivity_parameter, sensitivity_level, Scenario, OD_strategy)
+
+  list(
+    od_results_sens = od_results_sens,
+    baseline_no_od_sens = baseline_no_od_sens,
+    od_three_group_country = od_three_group_country,
+    od_three_group_pooled = od_three_group_pooled
+  )
+}
+
+# -----------------------------
+# E) RUN THE THREE ONE-WAY SENSITIVITY ANALYSES
+# -----------------------------
+sensitivity_runs <- list(
+
+  FollowUpCost = purrr::imap_dfr(sensitivity_levels, function(mult, lev) {
+    run_sensitivity_case(
+      fu_cost_multiplier = mult,
+      cadx_cost_multiplier = 1,
+      histo_cost_multiplier = 1,
+      sensitivity_parameter = "Follow-up colonoscopy cost",
+      sensitivity_level = lev
+    )$od_three_group_pooled
+  }),
+
+  CADxDeviceCost = purrr::imap_dfr(sensitivity_levels, function(mult, lev) {
+    run_sensitivity_case(
+      fu_cost_multiplier = 1,
+      cadx_cost_multiplier = mult,
+      histo_cost_multiplier = 1,
+      sensitivity_parameter = "CADx device cost",
+      sensitivity_level = lev
+    )$od_three_group_pooled
+  }),
+
+  HistopathologyCost = purrr::imap_dfr(sensitivity_levels, function(mult, lev) {
+    run_sensitivity_case(
+      fu_cost_multiplier = 1,
+      cadx_cost_multiplier = 1,
+      histo_cost_multiplier = mult,
+      sensitivity_parameter = "Histopathology submission cost",
+      sensitivity_level = lev
+    )$od_three_group_pooled
+  })
+)
+
+one_way_sensitivity_pooled <- dplyr::bind_rows(sensitivity_runs) %>%
+  dplyr::mutate(
+    sensitivity_level = factor(sensitivity_level, levels = names(sensitivity_levels))
+  ) %>%
+  dplyr::arrange(sensitivity_parameter, sensitivity_level, Scenario, OD_strategy)
+
+# -----------------------------
+# F) BASE-CASE REFERENCE TABLE
+# -----------------------------
+one_way_base_case <- one_way_sensitivity_pooled %>%
+  dplyr::filter(sensitivity_level == "base") %>%
+  dplyr::arrange(Scenario, OD_strategy, sensitivity_parameter)
+
+# -----------------------------
+# G) RANGE SUMMARY
+# Shows the low-to-high range for each parameter
+# -----------------------------
+one_way_range_summary <- one_way_sensitivity_pooled %>%
+  dplyr::group_by(sensitivity_parameter, Scenario, OD_strategy) %>%
+  dplyr::summarise(
+    No_OD_min = min(No_OD_extended_cost_per_CRC, na.rm = TRUE),
+    No_OD_max = max(No_OD_extended_cost_per_CRC, na.rm = TRUE),
+    Endoscopist_OD_min = min(Endoscopist_OD_extended_cost_per_CRC, na.rm = TRUE),
+    Endoscopist_OD_max = max(Endoscopist_OD_extended_cost_per_CRC, na.rm = TRUE),
+    CADx_OD_min = min(CADx_OD_extended_cost_per_CRC, na.rm = TRUE),
+    CADx_OD_max = max(CADx_OD_extended_cost_per_CRC, na.rm = TRUE),
+    Incremental_CADx_vs_Endoscopist_min = min(Incremental_CADx_OD_vs_Endoscopist_OD, na.rm = TRUE),
+    Incremental_CADx_vs_Endoscopist_max = max(Incremental_CADx_OD_vs_Endoscopist_OD, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(sensitivity_parameter, Scenario, OD_strategy)
+
+# -----------------------------
+# H) FORMATTED TABLES
+# -----------------------------
+fmt_money_cols <- function(df, cols) {
+  for (cc in cols) df[[cc]] <- fmt_dollar_na(df[[cc]], 1)
+  df
+}
+
+money_cols_pooled <- c(
+  "No_OD_extended_cost_per_CRC",
+  "Endoscopist_OD_extended_cost_per_CRC",
+  "CADx_OD_extended_cost_per_CRC",
+  "Incremental_Endoscopist_OD_vs_No_OD",
+  "Incremental_CADx_OD_vs_Endoscopist_OD",
+  "Incremental_CADx_OD_vs_No_OD"
+)
+
+money_cols_range <- c(
+  "No_OD_min", "No_OD_max",
+  "Endoscopist_OD_min", "Endoscopist_OD_max",
+  "CADx_OD_min", "CADx_OD_max",
+  "Incremental_CADx_vs_Endoscopist_min",
+  "Incremental_CADx_vs_Endoscopist_max"
+)
+
+one_way_sensitivity_pooled_fmt <- fmt_money_cols(one_way_sensitivity_pooled, money_cols_pooled)
+one_way_base_case_fmt <- fmt_money_cols(one_way_base_case, money_cols_pooled)
+one_way_range_summary_fmt <- fmt_money_cols(one_way_range_summary, money_cols_range)
+
+# -----------------------------
+# I) OPTIONAL: SIMPLE ABSTRACT-READY RANGE TABLE
+# Focuses on incremental CADx vs endoscopist OD
+# -----------------------------
+abstract_sensitivity_table <- one_way_range_summary %>%
+  dplyr::transmute(
+    sensitivity_parameter,
+    Scenario,
+    OD_strategy,
+    Incremental_CADx_vs_Endoscopist_low = Incremental_CADx_vs_Endoscopist_min,
+    Incremental_CADx_vs_Endoscopist_high = Incremental_CADx_vs_Endoscopist_max
+  ) %>%
+  dplyr::arrange(sensitivity_parameter, Scenario, OD_strategy)
+
+abstract_sensitivity_table_fmt <- abstract_sensitivity_table %>%
+  dplyr::mutate(
+    Incremental_CADx_vs_Endoscopist_low =
+      fmt_dollar_na(Incremental_CADx_vs_Endoscopist_low, 1),
+    Incremental_CADx_vs_Endoscopist_high =
+      fmt_dollar_na(Incremental_CADx_vs_Endoscopist_high, 1)
+  )
+
+# -----------------------------
+# J) EXPORT
+# -----------------------------
+downloads_dir <- file.path(path.expand("~"), "Downloads")
+if (!dir.exists(downloads_dir)) downloads_dir <- getwd()
+
+sens_out_file <- file.path(
+  downloads_dir,
+  paste0("CADe_OD_one_way_sensitivity_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".xlsx")
+)
+
+sens_sheets <- list(
+  OneWay_Sensitivity_Pooled = one_way_sensitivity_pooled,
+  OneWay_Sensitivity_Pooled_fmt = one_way_sensitivity_pooled_fmt,
+  OneWay_BaseCase = one_way_base_case,
+  OneWay_BaseCase_fmt = one_way_base_case_fmt,
+  OneWay_Range_Summary = one_way_range_summary,
+  OneWay_Range_Summary_fmt = one_way_range_summary_fmt,
+  Abstract_Sensitivity_Table = abstract_sensitivity_table,
+  Abstract_Sensitivity_Table_fmt = abstract_sensitivity_table_fmt
+)
+
+safe_write_xlsx(sens_sheets, sens_out_file)
+message("ONE-WAY SENSITIVITY ANALYSIS DONE.")
+print(one_way_range_summary_fmt)
